@@ -37,6 +37,7 @@ import {
   type PipelinePhase,
   type CommunitiesOutput,
   type ProcessesOutput,
+  type ParseOutput,
 } from './pipeline-phases/index.js';
 
 export interface PipelineOptions {
@@ -112,10 +113,7 @@ export const runPipelineFromRepo = async (
   });
 
   // Extract final results for the PipelineResult contract
-  const { totalFiles, usedWorkerPool } = getPhaseOutput<{
-    totalFiles: number;
-    usedWorkerPool: boolean;
-  }>(results, 'parse');
+  const { totalFiles, usedWorkerPool, parserCoverage } = getPhaseOutput<ParseOutput>(results, 'parse');
 
   let communityResult: CommunitiesOutput['communityResult'] | undefined;
   let processResult: ProcessesOutput['processResult'] | undefined;
@@ -146,5 +144,6 @@ export const runPipelineFromRepo = async (
     communityResult,
     processResult,
     usedWorkerPool,
+    parserCoverage,
   };
 };

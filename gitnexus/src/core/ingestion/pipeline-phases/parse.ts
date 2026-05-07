@@ -30,6 +30,7 @@ import type {
 import type { createResolutionContext } from '../model/resolution-context.js';
 import { runChunkedParseAndResolve } from './parse-impl.js';
 import type { ASTCache } from '../ast-cache.js';
+import type { ParserCoverage } from '../../../types/pipeline.js';
 
 export interface ParseOutput {
   /**
@@ -81,6 +82,8 @@ export interface ParseOutput {
    * `scopeTreeCache.clear()` after its extract loop finishes.
    */
   readonly scopeTreeCache: ASTCache;
+  /** Parser coverage — which files were parsed vs skipped */
+  readonly parserCoverage: ParserCoverage;
 }
 
 export const parsePhase: PipelinePhase<ParseOutput> = {

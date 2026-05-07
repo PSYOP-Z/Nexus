@@ -197,6 +197,12 @@ export interface CodebaseContext {
     communityCount: number;
     processCount: number;
   };
+  parserCoverage?: {
+    totalFiles: number;
+    supportedFiles: number;
+    unsupportedFiles: number;
+    unsupportedByExtension: Array<{ extension: string; count: number }>;
+  };
 }
 
 interface RepoHandle {
@@ -316,6 +322,7 @@ export class LocalBackend {
           communityCount: s.communities || 0,
           processCount: s.processes || 0,
         },
+        parserCoverage: s.parserCoverage,
       });
     }
 

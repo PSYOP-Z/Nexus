@@ -108,6 +108,12 @@ export interface AnalyzeResult {
     communities?: number;
     processes?: number;
     embeddings?: number;
+    parserCoverage?: {
+      totalFiles: number;
+      supportedFiles: number;
+      unsupportedFiles: number;
+      unsupportedByExtension: Array<{ extension: string; count: number }>;
+    };
   };
   alreadyUpToDate?: boolean;
   /** The raw pipeline result — only populated when needed by callers (e.g. skill generation). */
@@ -472,6 +478,7 @@ export async function runFullAnalysis(
         communities: pipelineResult.communityResult?.stats.totalCommunities,
         processes: pipelineResult.processResult?.stats.totalProcesses,
         embeddings: embeddingCount,
+        parserCoverage: pipelineResult.parserCoverage,
       },
       capabilities: {
         graph: { provider: 'ladybugdb', status: runtimeCapabilities.graph },

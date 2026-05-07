@@ -118,6 +118,13 @@ export async function runChunkedParseAndResolve(
    *  source. See plan
    *  docs/plans/2026-04-20-002-perf-parse-heritage-mro-plan.md (Unit 4). */
   scopeTreeCache: ASTCache;
+  /** Parser coverage — which files were parsed vs skipped */
+  parserCoverage: {
+    totalFiles: number;
+    supportedFiles: number;
+    unsupportedFiles: number;
+    unsupportedByExtension: Array<{ extension: string; count: number }>;
+  };
 }> {
   const ctx = createResolutionContext();
   const symbolTable = ctx.model.symbols;
@@ -126,6 +133,28 @@ export async function runChunkedParseAndResolve(
     const lang = getLanguageFromFilename(f.path);
     return lang && isLanguageAvailable(lang);
   });
+
+  // ── Parser coverage stats ──────────────────────────────────────────
+  const unsupportedExtCounts = new Map<string, number>();
+  for (const f of scannedFiles) {
+    const lang = getLanguageFromFilename(f.path);
+    if (!lang) {
+      const ext = path.extname(f.path).toLowerCase() || '(no extension)';
+      unsupportedExtCounts.set(ext, (unsupportedExtCounts.get(ext) || 0) + 1);
+    }
+  }
+  const unsupportedByExtension = Array.from(unsupportedExtCounts.entries())
+    .map(([extension, count]) => ({ extension, count }))
+    .sort((a, b) => b.count - a.count);
+  const unsupportedFiles = unsupportedByExtension.reduce((sum, e) => sum + e.count, 0);
+  const supportedFiles = parseableScanned.length;
+
+  const parserCoverage = {
+    totalFiles: scannedFiles.length,
+    supportedFiles,
+    unsupportedFiles,
+    unsupportedByExtension,
+  };
 
   // Warn about files skipped due to unavailable parsers
   const skippedByLang = new Map<string, number>();
@@ -138,6 +167,14 @@ export async function runChunkedParseAndResolve(
   for (const [lang, count] of skippedByLang) {
     console.warn(
       `Skipping ${count} ${lang} file(s) — ${lang} parser not available (native binding may not have built). Try: npm rebuild tree-sitter-${lang}`,
+    );
+  }
+
+  // Warn about files with unsupported extensions (no grammar at all)
+  if (unsupportedFiles > 0) {
+    const topExts = unsupportedByExtension.slice(0, 5).map((e) => `${e.extension}: ${e.count}`);
+    console.warn(
+      `Skipped ${unsupportedFiles} files with unsupported extensions (${topExts.join(', ')}${unsupportedByExtension.length > 5 ? ', ...' : ''})`,
     );
   }
 
@@ -620,5 +657,6 @@ export async function runChunkedParseAndResolve(
     // chunk-local `astCache` above is intentionally NOT exposed
     // because parse-impl clears it between chunks.
     scopeTreeCache,
+    parserCoverage,
   };
 }
