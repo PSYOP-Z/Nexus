@@ -179,6 +179,33 @@ describe('parse-impl sequential fallback cleanup (U6)', () => {
     expect(spies.astCacheClearCalls).toBeGreaterThan(clearsBefore);
   });
 
+  it('parserCoverage: unsupported extensions are counted and not zero', async () => {
+    const repoWithUnsupported = makeTempRepo({
+      'a.ts': `export function foo() {}\n`,
+      'readme.md': `# hello\n`,
+      'data.csv': `a,b,c\n`,
+    });
+    try {
+      const graph = createKnowledgeGraph();
+      const files = ['a.ts', 'readme.md', 'data.csv'];
+      const result = await runChunkedParseAndResolve(
+        graph,
+        scanned(repoWithUnsupported, files),
+        files,
+        files.length,
+        repoWithUnsupported,
+        Date.now(),
+        () => {},
+        { skipWorkers: true },
+      );
+      expect(result.parserCoverage.unsupportedFiles).toBeGreaterThan(0);
+      expect(result.parserCoverage.unsupportedByExtension.length).toBeGreaterThan(0);
+      expect(result.parserCoverage.totalFiles).toBe(3);
+    } finally {
+      fs.rmSync(repoWithUnsupported, { recursive: true, force: true });
+    }
+  });
+
   it('error path: processCalls throws in fallback loop — cleanup still runs', async () => {
     const graph = createKnowledgeGraph();
     const files = ['a.ts', 'b.ts'];
