@@ -93,6 +93,9 @@
     "tree-sitter-typescript": "^0.23.2",
     "uuid": "^14.0.0"
   },
+  "optionalDependencies": {
+    "@tree-sitter-grammars/tree-sitter-zig": "1.1.2"
+  },
   "devDependencies": {
     "@types/busboy": "^1.5.4",
     "@types/cli-progress": "^3.11.6",
@@ -110,6 +113,9 @@
   "overrides": {
     "@huggingface/transformers": {
       "onnxruntime-node": "$onnxruntime-node"
+    },
+    "@tree-sitter-grammars/tree-sitter-zig": {
+      "tree-sitter": "$tree-sitter"
     }
   },
   "engines": {
