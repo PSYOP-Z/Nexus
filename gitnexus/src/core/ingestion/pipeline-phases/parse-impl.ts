@@ -174,7 +174,7 @@ export async function runChunkedParseAndResolve(
   // Warn about files with unsupported extensions (no grammar at all)
   if (unsupportedFiles > 0) {
     const topExts = unsupportedByExtension.slice(0, 5).map((e) => `${e.extension}: ${e.count}`);
-    console.warn(
+    logger.warn(
       `Skipped ${unsupportedFiles} files with unsupported extensions (${topExts.join(', ')}${unsupportedByExtension.length > 5 ? ', ...' : ''})`,
     );
   }
