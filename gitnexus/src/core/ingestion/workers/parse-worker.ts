@@ -20,6 +20,7 @@ import {
   getTreeSitterContentByteLength,
   TREE_SITTER_MAX_BUFFER,
 } from '../constants.js';
+import { parseSourceSafe } from '../../tree-sitter/safe-parse.js';
 import type { SymbolTableReader } from '../model/symbol-table.js';
 import type { ExtractedHeritage } from '../model/heritage-map.js';
 
@@ -1407,11 +1408,16 @@ const processFileGroup = (
       isVueSetup = extracted.isSetup;
     }
 
+    // Per-language source-text transform (e.g., UE macro stripping for C++).
+    // Length-preserving — see LanguageProvider.preprocessSource contract.
+    parseContent =
+      getProvider(language).preprocessSource?.(parseContent, file.path) ?? parseContent;
+
     clearCaches(); // Reset memoization before each new file
 
     let tree;
     try {
-      tree = parser.parse(parseContent, undefined, {
+      tree = parseSourceSafe(parser, parseContent, undefined, {
         bufferSize: getTreeSitterBufferSize(parseContent),
       });
     } catch (err) {
