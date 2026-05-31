@@ -9,8 +9,12 @@ export const EXTENSIONS = [
   // TypeScript/JavaScript
   '.tsx',
   '.ts',
+  '.mts',
+  '.cts',
   '.jsx',
   '.js',
+  '.mjs',
+  '.cjs',
   '.vue',
   '/index.tsx',
   '/index.ts',
@@ -53,7 +57,10 @@ export const EXTENSIONS = [
  * Try to match a path (with extensions) against the known file set.
  * Returns the matched file path or null.
  */
-export function tryResolveWithExtensions(basePath: string, allFiles: Set<string>): string | null {
+export function tryResolveWithExtensions(
+  basePath: string,
+  allFiles: ReadonlySet<string>,
+): string | null {
   for (const ext of EXTENSIONS) {
     const candidate = basePath + ext;
     if (allFiles.has(candidate)) return candidate;

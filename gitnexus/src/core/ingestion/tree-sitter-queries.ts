@@ -6,6 +6,8 @@
  * compatible with the standard tree-sitter grammars.
  */
 
+import { ARRAY_METHOD_NOT_ANY_OF_PREDICATE } from './ts-js-hoc-utils.js';
+
 // TypeScript queries - works with tree-sitter-typescript
 export const TYPESCRIPT_QUERIES = `
 (class_declaration
@@ -95,10 +97,17 @@ export const TYPESCRIPT_QUERIES = `
 ; \`tsExtractFunctionName\` for the resolution logic and the \`query.ts\`
 ; comment for the full anchor-discipline rationale and the chained-
 ; array-method trade-off.
+;
+; NOTE: Excludes member-expression calls to common array methods (map, filter,
+; reduce, etc.) to avoid false positives like \`const x = arr.map(a => ...)\`
+; being classified as a Function when it's actually a Const holding an array.
+; Direct identifier calls and member expressions on non-array-methods (like
+; React.memo) are still matched.
 (lexical_declaration
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (arrow_function))))) @definition.function
 
@@ -106,14 +115,36 @@ export const TYPESCRIPT_QUERIES = `
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (function_expression))))) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
 
 (export_statement
   declaration: (lexical_declaration
     (variable_declarator
       name: (identifier) @name
       value: (call_expression
+        function: (identifier)
         arguments: (arguments
           (arrow_function)))))) @definition.function
 
@@ -122,15 +153,40 @@ export const TYPESCRIPT_QUERIES = `
     (variable_declarator
       name: (identifier) @name
       value: (call_expression
+        function: (identifier)
         arguments: (arguments
           (function_expression)))))) @definition.function
 
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (member_expression
+          property: (property_identifier) @callee)
+        arguments: (arguments
+          (arrow_function)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (member_expression
+          property: (property_identifier) @callee)
+        arguments: (arguments
+          (function_expression)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
 ; \`var X = HOC(...)\` parity with registry-primary. Legacy code (and any
 ; transpiler output that downlevels \`const\` to \`var\`) hits this shape.
+; Same array-method exclusions as const/let patterns above.
 (variable_declaration
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (arrow_function))))) @definition.function
 
@@ -138,8 +194,59 @@ export const TYPESCRIPT_QUERIES = `
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (function_expression))))) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+; HOC-wrapped default exports: \`export default defineEventHandler(async (e) => { ... })\`.
+; The worker rewrites the wrapper-derived @name to a file-derived symbol name
+; so helpers like \`defineEventHandler\` / \`React.memo\` do not collapse
+; unrelated modules onto the same Function name.
+ (export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (arrow_function)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (function_expression)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (arrow_function)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (function_expression)))) @definition.function
 
 ; Variable/constant declarations (non-function values).
 ; Overlap with @definition.function patterns is handled by parse-worker dedup.
@@ -241,6 +348,12 @@ export const TYPESCRIPT_QUERIES = `
     [(string (string_fragment) @route.url)
      (template_string) @route.template_url])) @route.fetch
 
+; Custom fetch wrappers: apiFetch('/path'), fetchJSON('/api/data'), httpGet('/users'), etc.
+(call_expression
+  function: (identifier) @_wrapper_fn (#match? @_wrapper_fn "^(api(Fetch|Get|Post|Put|Delete|Patch|Request)|fetch(API|JSON|Data|Endpoint|Resource|Url)|http(Fetch|Get|Post|Put|Delete|Patch|Request))$")
+  arguments: (arguments
+    (string (string_fragment) @route.url))) @route.fetch
+
 ; axios.get/post/put/delete/patch('/path'), $.get/post/ajax({url:'/path'})
 (call_expression
   function: (member_expression
@@ -323,10 +436,12 @@ export const JAVASCRIPT_QUERIES = `
 ; / debounce / user-defined HOC factories). Both \`const\` and \`var\` forms
 ; are mirrored so JS code that uses \`var\` (or transpiler output) gets the
 ; same attribution as the registry-primary path.
+; Excludes common array methods (map, filter, reduce, etc.) to avoid false positives.
 (lexical_declaration
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (arrow_function))))) @definition.function
 
@@ -334,14 +449,36 @@ export const JAVASCRIPT_QUERIES = `
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (function_expression))))) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
 
 (export_statement
   declaration: (lexical_declaration
     (variable_declarator
       name: (identifier) @name
       value: (call_expression
+        function: (identifier)
         arguments: (arguments
           (arrow_function)))))) @definition.function
 
@@ -350,14 +487,39 @@ export const JAVASCRIPT_QUERIES = `
     (variable_declarator
       name: (identifier) @name
       value: (call_expression
+        function: (identifier)
         arguments: (arguments
           (function_expression)))))) @definition.function
 
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (member_expression
+          property: (property_identifier) @callee)
+        arguments: (arguments
+          (arrow_function)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (member_expression
+          property: (property_identifier) @callee)
+        arguments: (arguments
+          (function_expression)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
 ; \`var X = HOC(...)\` parity with registry-primary.
+; Same array-method exclusions as const/let patterns.
 (variable_declaration
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (arrow_function))))) @definition.function
 
@@ -365,8 +527,56 @@ export const JAVASCRIPT_QUERIES = `
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (function_expression))))) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function))))
+  (#not-any-of? @callee "map" "filter" "reduce" "forEach" "find" "findIndex" "some" "every" "flatMap" "sort" "splice" "slice" "concat" "fill" "copyWithin" "join" "flat" "at" "entries" "keys" "values" "indexOf" "lastIndexOf" "includes" "pop" "push" "shift" "unshift" "reverse" "reduceRight" "toSorted" "toReversed" "toSpliced" "with")) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression))))
+  (#not-any-of? @callee "map" "filter" "reduce" "forEach" "find" "findIndex" "some" "every" "flatMap" "sort" "splice" "slice" "concat" "fill" "copyWithin" "join" "flat" "at" "entries" "keys" "values" "indexOf" "lastIndexOf" "includes" "pop" "push" "shift" "unshift" "reverse" "reduceRight" "toSorted" "toReversed" "toSpliced" "with")) @definition.function
+
+; HOC-wrapped default exports (JS parity with TS patterns above).
+ (export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (arrow_function)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (function_expression)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (arrow_function)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (function_expression)))) @definition.function
 
 ; Variable/constant declarations (non-function values).
 ; Overlap with @definition.function patterns is handled by parse-worker dedup.
@@ -433,6 +643,12 @@ export const JAVASCRIPT_QUERIES = `
   arguments: (arguments
     [(string (string_fragment) @route.url)
      (template_string) @route.template_url])) @route.fetch
+
+; Custom fetch wrappers: apiFetch('/path'), fetchJSON('/api/data'), httpGet('/users'), etc.
+(call_expression
+  function: (identifier) @_wrapper_fn (#match? @_wrapper_fn "^(api(Fetch|Get|Post|Put|Delete|Patch|Request)|fetch(API|JSON|Data|Endpoint|Resource|Url)|http(Fetch|Get|Post|Put|Delete|Patch|Request))$")
+  arguments: (arguments
+    (string (string_fragment) @route.url))) @route.fetch
 
 ; axios.get/post, $.get/post/ajax
 (call_expression
@@ -594,8 +810,17 @@ export const C_QUERIES = `
 
 ; Structs, Unions, Enums, Typedefs
 (struct_specifier name: (type_identifier) @name) @definition.struct
+(type_definition
+  type: (struct_specifier
+    body: (field_declaration_list))
+  declarator: (type_identifier) @name) @definition.struct
 (union_specifier name: (type_identifier) @name) @definition.union
 (enum_specifier name: (type_identifier) @name) @definition.enum
+(type_definition
+  type: (enum_specifier
+    body: (enumerator_list))
+  declarator: (type_identifier) @name) @definition.enum
+(enumerator name: (identifier) @name) @definition.const
 (type_definition declarator: (type_identifier) @name) @definition.typedef
 
 ; Macros
@@ -680,11 +905,28 @@ export const GO_QUERIES = `
 export const CPP_QUERIES = `
 ; Classes, Structs, Namespaces
 (class_specifier name: (type_identifier) @name) @definition.class
+(class_specifier
+  name: (template_type
+    (type_identifier) @name
+    (template_argument_list) @template-arguments)) @definition.class
 (struct_specifier name: (type_identifier) @name) @definition.struct
+(struct_specifier
+  name: (template_type
+    (type_identifier) @name
+    (template_argument_list) @template-arguments)) @definition.struct
 (namespace_definition name: (namespace_identifier) @name) @definition.namespace
 (enum_specifier name: (type_identifier) @name) @definition.enum
 
 ; Typedefs and unions (common in C-style headers and mixed C/C++ code)
+(type_definition
+  type: (struct_specifier
+    body: (field_declaration_list))
+  declarator: (type_identifier) @name) @definition.struct
+(type_definition
+  type: (enum_specifier
+    body: (enumerator_list))
+  declarator: (type_identifier) @name) @definition.enum
+(enumerator name: (identifier) @name) @definition.const
 (type_definition declarator: (type_identifier) @name) @definition.typedef
 (union_specifier name: (type_identifier) @name) @definition.union
 
@@ -694,7 +936,9 @@ export const CPP_QUERIES = `
 
 ; Functions & Methods (direct declarator)
 (function_definition declarator: (function_declarator declarator: (identifier) @name)) @definition.function
+(function_definition declarator: (function_declarator declarator: (operator_name) @name)) @definition.function
 (function_definition declarator: (function_declarator declarator: (qualified_identifier name: (identifier) @name))) @definition.method
+(function_definition declarator: (function_declarator declarator: (qualified_identifier name: (operator_name) @name))) @definition.method
 
 ; Functions/methods returning pointers (pointer_declarator wraps function_declarator)
 (function_definition declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))) @definition.function
@@ -706,14 +950,18 @@ export const CPP_QUERIES = `
 
 ; Functions/methods returning references (reference_declarator wraps function_declarator)
 (function_definition declarator: (reference_declarator (function_declarator declarator: (identifier) @name))) @definition.function
+(function_definition declarator: (reference_declarator (function_declarator declarator: (operator_name) @name))) @definition.function
 (function_definition declarator: (reference_declarator (function_declarator declarator: (qualified_identifier name: (identifier) @name)))) @definition.method
+(function_definition declarator: (reference_declarator (function_declarator declarator: (qualified_identifier name: (operator_name) @name)))) @definition.method
 
 ; Destructors (destructor_name is distinct from identifier in tree-sitter-cpp)
 (function_definition declarator: (function_declarator declarator: (qualified_identifier name: (destructor_name) @name))) @definition.method
 
 ; Function declarations / prototypes (common in headers)
 (declaration declarator: (function_declarator declarator: (identifier) @name)) @definition.function
+(declaration declarator: (function_declarator declarator: (operator_name) @name)) @definition.function
 (declaration declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))) @definition.function
+(declaration declarator: (reference_declarator (function_declarator declarator: (operator_name) @name))) @definition.function
 
 ; Class/struct data member fields (Address address; int count;)
 ; Uses field_identifier to exclude method declarations (which use function_declarator)
@@ -732,13 +980,13 @@ export const CPP_QUERIES = `
 
 ; Inline class method declarations (inside class body, no body: void save();)
 ; tree-sitter-cpp uses field_identifier (not identifier) for names inside class bodies
-(field_declaration declarator: (function_declarator declarator: [(field_identifier) (identifier)] @name)) @definition.method
+(field_declaration declarator: (function_declarator declarator: [(field_identifier) (identifier) (operator_name)] @name)) @definition.method
 
 ; Inline class method declarations returning a pointer (User* lookup();)
 (field_declaration declarator: (pointer_declarator declarator: (function_declarator declarator: [(field_identifier) (identifier)] @name))) @definition.method
 
 ; Inline class method declarations returning a reference (User& lookup();)
-(field_declaration declarator: (reference_declarator (function_declarator declarator: [(field_identifier) (identifier)] @name))) @definition.method
+(field_declaration declarator: (reference_declarator (function_declarator declarator: [(field_identifier) (identifier) (operator_name)] @name))) @definition.method
 
 ; Inline class method definitions (inside class body, with body: void Foo() { ... })
 (field_declaration_list
@@ -762,6 +1010,11 @@ export const CPP_QUERIES = `
 
 ; Templates
 (template_declaration (class_specifier name: (type_identifier) @name)) @definition.template
+(template_declaration
+  (class_specifier
+    name: (template_type
+      (type_identifier) @name
+      (template_argument_list) @template-arguments))) @definition.template
 (template_declaration (function_definition declarator: (function_declarator declarator: (identifier) @name))) @definition.template
 
 ; Includes
@@ -772,6 +1025,8 @@ export const CPP_QUERIES = `
 (call_expression function: (field_expression field: (field_identifier) @call.name)) @call
 (call_expression function: (qualified_identifier name: (identifier) @call.name)) @call
 (call_expression function: (template_function name: (identifier) @call.name)) @call
+(binary_expression operator: "+" @call.name) @call
+(binary_expression operator: "<<" @call.name) @call
 
 ; Constructor calls: new User()
 (new_expression type: (type_identifier) @call.name) @call
@@ -1015,6 +1270,16 @@ export const PHP_QUERIES = `
 
 ; ── Heritage: use trait (must capture enclosing class name) ──────────────────
 (class_declaration
+  name: (name) @heritage.class
+  body: (declaration_list
+    (use_declaration
+      [(name) (qualified_name)] @heritage.trait))) @heritage
+
+; ── Heritage: trait uses another trait (transitive trait composition) ────────
+; PHP allows a trait body to contain "use OtherTrait;". The trait-uses-trait
+; IMPLEMENTS edge is required by buildPhpMro to compute the full transitive
+; trait closure (depth 3+ chains).
+(trait_declaration
   name: (name) @heritage.class
   body: (declaration_list
     (use_declaration

@@ -25,6 +25,7 @@
 
 import type { ParsedFile, RegistryProviders } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../../../graph/types.js';
+import { lookupOwnedMembersByOwner } from '../../model/owned-members-lookup.js';
 import type { MutableSemanticModel, SemanticModel } from '../../model/semantic-model.js';
 import { reconcileOwnership, validateOwnershipParity } from './reconcile-ownership.js';
 import { validateBindingsImmutability } from './validate-bindings-immutability.js';
@@ -32,16 +33,95 @@ import { extractParsedFile } from '../../scope-extractor-bridge.js';
 import { finalizeScopeModel } from '../../finalize-orchestrator.js';
 import { resolveReferenceSites, type ResolveStats } from '../../resolve-references.js';
 import { buildGraphNodeLookup } from '../graph-bridge/node-lookup.js';
+import { resolveDefGraphId } from '../graph-bridge/ids.js';
 import { buildPopulatedMethodDispatch } from '../graph-bridge/method-dispatch.js';
+import { tryEmitEdge } from '../graph-bridge/edges.js';
 import { propagateImportedReturnTypes } from '../passes/imported-return-types.js';
 import { emitReceiverBoundCalls } from '../passes/receiver-bound-calls.js';
 import { emitFreeCallFallback } from '../passes/free-call-fallback.js';
 import { emitReferencesViaLookup } from '../graph-bridge/references-to-edges.js';
 import { emitImportEdges } from '../graph-bridge/imports-to-edges.js';
 import type { ScopeResolver } from '../contract/scope-resolver.js';
+import { findClassBindingInScope, findEnclosingClassDef } from '../scope/walkers.js';
 import { buildWorkspaceResolutionIndex } from '../workspace-index.js';
+import type { ResolutionOutcome, ResolutionOutcomeRecorder } from '../resolution-outcome.js';
 
 import { logger } from '../../../logger.js';
+
+/**
+ * Resolve inheritance reference sites early and pre-emit their EXTENDS edges
+ * before MRO construction. This lets template-base captures contribute to the
+ * graph in time for `buildMro`, while `handledSites` prevents the generic
+ * reference-edge bridge from re-emitting the same sites later.
+ *
+ * @returns Site keys to seed the downstream handled-site skip set.
+ */
+function preEmitInheritanceEdges(
+  graph: KnowledgeGraph,
+  scopes: ReturnType<typeof finalizeScopeModel>,
+  nodeLookup: ReturnType<typeof buildGraphNodeLookup>,
+): Set<string> {
+  const handledSites = new Set<string>();
+  const seen = new Set<string>();
+  const existing = new Set<string>();
+  for (const rel of graph.iterRelationshipsByType('EXTENDS')) {
+    existing.add(`${rel.sourceId}->${rel.targetId}`);
+  }
+
+  for (const site of scopes.referenceSites) {
+    if (site.kind !== 'inherits') continue;
+    const scope = scopes.scopeTree.getScope(site.inScope);
+    const siteKey =
+      scope?.filePath !== undefined
+        ? `${scope.filePath}:${site.atRange.startLine}:${site.atRange.startCol}`
+        : undefined;
+    if (siteKey !== undefined) {
+      // Intentionally suppress every `inherits` site from the generic
+      // reference bridge, even when this pre-pass can't emit an EXTENDS
+      // edge. The shared bridge resolves the source via
+      // `resolveCallerGraphId`, which can degrade class-heritage sites into
+      // method-owned EXTENDS edges once methods exist on the class. This
+      // pre-pass is the authoritative inheritance emitter, so broad
+      // suppression keeps `buildMro` and the final graph class-owned.
+      handledSites.add(siteKey);
+    }
+
+    const targetDef = findClassBindingInScope(site.inScope, site.name, scopes);
+    if (targetDef === undefined) continue;
+
+    const callerClass = findEnclosingClassDef(site.inScope, scopes);
+    if (callerClass === undefined) continue;
+    const callerGraphId = resolveDefGraphId(callerClass.filePath, callerClass, nodeLookup);
+    const targetGraphId = resolveDefGraphId(targetDef.filePath, targetDef, nodeLookup);
+    if (callerGraphId === undefined || targetGraphId === undefined) continue;
+    const edgeKey = `${callerGraphId}->${targetGraphId}`;
+    if (existing.has(edgeKey)) continue;
+
+    if (
+      tryEmitEdge(
+        graph,
+        scopes,
+        nodeLookup,
+        site,
+        targetDef,
+        'scope-resolution: inherits',
+        seen,
+        0.85,
+      )
+    ) {
+      existing.add(edgeKey);
+    }
+  }
+
+  return handledSites;
+}
+
+export type ScopeResolutionSubPhase =
+  | 'extracting'
+  | 'analyzing types'
+  | 'resolving references'
+  | 'linking symbols';
+
 interface RunScopeResolutionInput {
   readonly graph: KnowledgeGraph;
   /**
@@ -88,6 +168,21 @@ interface RunScopeResolutionInput {
    * Cache miss is safe — falls back to fresh extract.
    */
   readonly preExtractedParsedFiles?: ReadonlyMap<string, ParsedFile>;
+  /**
+   * Optional additive diagnostics sink. Resolver passes call this when they
+   * intentionally suppress an edge; the graph remains unchanged.
+   */
+  readonly recordResolutionOutcome?: ResolutionOutcomeRecorder;
+  /**
+   * Optional progress callback for UI updates during long-running scope
+   * resolution. Called periodically during the extract loop and at each
+   * sub-phase boundary (finalize, resolve, emit).
+   *
+   * @param subPhase  Current sub-phase name for display
+   * @param current   Files processed so far (during extract) or total files (at phase boundaries)
+   * @param total     Total files in this language
+   */
+  readonly onProgress?: (subPhase: ScopeResolutionSubPhase, current: number, total: number) => void;
 }
 
 interface RunScopeResolutionStats {
@@ -97,6 +192,7 @@ interface RunScopeResolutionStats {
   readonly resolve: ResolveStats;
   readonly referenceEdgesEmitted: number;
   readonly referenceSkipped: number;
+  readonly resolutionOutcomes: readonly ResolutionOutcome[];
 }
 
 export function runScopeResolution(
@@ -105,6 +201,11 @@ export function runScopeResolution(
 ): RunScopeResolutionStats {
   const { graph, files } = input;
   const onWarn = input.onWarn ?? (() => {});
+  const resolutionOutcomes: ResolutionOutcome[] = [];
+  const recordResolutionOutcome: ResolutionOutcomeRecorder = (outcome) => {
+    resolutionOutcomes.push(outcome);
+    input.recordResolutionOutcome?.(outcome);
+  };
   const PROF = process.env.PROF_SCOPE_RESOLUTION === '1';
   const tStart = PROF ? process.hrtime.bigint() : 0n;
   let fileContents: Map<string, string> | undefined;
@@ -122,7 +223,10 @@ export function runScopeResolution(
   const treeCache = input.treeCache;
   const preExtracted = input.preExtractedParsedFiles;
   let preExtractedHits = 0;
-  for (const file of files) {
+  const progressInterval = files.length > 0 ? Math.max(1, Math.floor(files.length / 50)) : 1;
+  input.onProgress?.('extracting', 0, files.length);
+  for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
+    const file = files[fileIdx];
     let parsed: ParsedFile | undefined;
     // Fast path: a worker (during the parse phase) already produced a
     // ParsedFile for this file via `extractParsedFile`. Reuse it
@@ -147,6 +251,12 @@ export function runScopeResolution(
     }
     provider.populateOwners(parsed);
     parsedFiles.push(parsed);
+    if (
+      input.onProgress &&
+      ((fileIdx + 1) % progressInterval === 0 || fileIdx === files.length - 1)
+    ) {
+      input.onProgress('extracting', fileIdx + 1, files.length);
+    }
   }
   if (PROF && preExtracted !== undefined) {
     logger.warn(`[scope-resolution prof] pre-extracted hits: ${preExtractedHits}/${files.length}`);
@@ -175,15 +285,16 @@ export function runScopeResolution(
       resolve: { sitesProcessed: 0, referencesEmitted: 0, unresolved: 0 },
       referenceEdgesEmitted: 0,
       referenceSkipped: 0,
+      resolutionOutcomes,
     };
   }
 
   const tExtract = PROF ? process.hrtime.bigint() : 0n;
 
   // ── Phase 2: finalize → ScopeResolutionIndexes ─────────────────────────
+  input.onProgress?.('analyzing types', files.length, files.length);
   const allFilePaths = new Set(parsedFiles.map((f) => f.filePath));
   const nodeLookup = buildGraphNodeLookup(graph);
-  const mroByClassDefId = provider.buildMro(graph, parsedFiles, nodeLookup);
 
   const resolutionConfig = input.resolutionConfig;
   const finalized = finalizeScopeModel(parsedFiles, {
@@ -196,6 +307,32 @@ export function runScopeResolution(
         provider.mergeBindings(existing, incoming, scopeId),
     },
   });
+  const preEmittedInheritanceSites = preEmitInheritanceEdges(graph, finalized, nodeLookup);
+  // Call-based heritage hook (e.g., Ruby include/extend/prepend) — emits
+  // IMPLEMENTS edges that `preEmitInheritanceEdges` cannot produce because
+  // the heritage declarations are syntactic method calls, not grammar-level
+  // heritage clauses. Must run BEFORE `buildMro` so MRO construction sees
+  // the freshly-emitted IMPLEMENTS edges.
+  provider.emitHeritageEdges?.(graph, parsedFiles, nodeLookup);
+  // Implicit IMPORTS-edge hook — for languages whose files have compiler-
+  // implicit cross-file visibility (no syntactic import statement). The
+  // finalized-ImportEdge pipeline (`emitImportEdges`) cannot produce these
+  // because there is no `ImportEdge` to materialize. Idempotent.
+  provider.emitImplicitImportEdges?.(graph, parsedFiles, nodeLookup, resolutionConfig);
+  // Rebuild the node lookup after heritage-edge emission. Languages like
+  // Ruby create Property graph nodes inside `emitHeritageEdges`; those
+  // nodes must be visible to downstream passes (`emitReceiverBoundCalls`
+  // resolves write-access targets via `resolveDefGraphId` which consults
+  // `nodeLookup`). Without this rebuild, Property nodes added by the
+  // heritage hook are invisible and ACCESSES edges silently fail to emit.
+  const postHeritageNodeLookup =
+    provider.emitHeritageEdges !== undefined ? buildGraphNodeLookup(graph) : nodeLookup;
+  const mroByClassDefId = provider.buildMro(graph, parsedFiles, postHeritageNodeLookup);
+  const extendsOnlyMroByClassDefId = provider.buildExtendsOnlyMro?.(
+    graph,
+    parsedFiles,
+    postHeritageNodeLookup,
+  );
 
   // Replace the empty MethodDispatchIndex that finalizeScopeModel
   // builds by design with the populated one derived from the
@@ -205,7 +342,7 @@ export function runScopeResolution(
   // the type system.
   const indexes = {
     ...finalized,
-    methodDispatch: buildPopulatedMethodDispatch(mroByClassDefId),
+    methodDispatch: buildPopulatedMethodDispatch(mroByClassDefId, extendsOnlyMroByClassDefId),
   };
 
   // Build the workspace resolution index ONCE — scope-valued lookups
@@ -224,6 +361,7 @@ export function runScopeResolution(
     provider.populateNamespaceSiblings(parsedFiles, indexes, {
       fileContents: getFileContents(),
       treeCache,
+      resolutionConfig,
     });
   }
 
@@ -233,7 +371,7 @@ export function runScopeResolution(
   // propagateImportedReturnTypes so the SCC-ordered pass sees the
   // mirrored bindings.
   if (provider.mirrorNamespaceTypeBindings !== undefined) {
-    provider.mirrorNamespaceTypeBindings(parsedFiles, indexes, workspaceIndex);
+    provider.mirrorNamespaceTypeBindings(parsedFiles, indexes, workspaceIndex, resolutionConfig);
   }
 
   // Cross-file return-type propagation (Contract Invariant I3 timing:
@@ -262,46 +400,70 @@ export function runScopeResolution(
   validateBindingsImmutability(indexes, onWarn);
 
   // ── Phase 3: resolve references via Registry.lookup ────────────────────
+  input.onProgress?.('resolving references', files.length, files.length);
   const registryProviders: RegistryProviders = {
     arityCompatibility: provider.arityCompatibility,
   };
   const { referenceIndex, stats: resolveStats } = resolveReferenceSites({
     scopes: indexes,
     providers: registryProviders,
+    ownedMembersByOwner: (ownerDefId, memberName) =>
+      lookupOwnedMembersByOwner(readonlyModel, ownerDefId, memberName),
   });
   const tResolve = PROF ? process.hrtime.bigint() : 0n;
 
   // ── Phase 4: emit graph edges (LOAD-BEARING ORDER — see I1) ────────────
-  const handledSites = new Set<string>();
+  input.onProgress?.('linking symbols', files.length, files.length);
+  const handledSites = new Set<string>(preEmittedInheritanceSites);
   const receiverExtras = emitReceiverBoundCalls(
     graph,
     indexes,
     parsedFiles,
-    nodeLookup,
+    postHeritageNodeLookup,
     handledSites,
     provider,
     workspaceIndex,
     readonlyModel,
+    {
+      recordResolutionOutcome,
+    },
   );
+  const unresolvedReceiverExtras =
+    provider.emitUnresolvedReceiverEdges !== undefined
+      ? provider.emitUnresolvedReceiverEdges(
+          graph,
+          indexes,
+          parsedFiles,
+          postHeritageNodeLookup,
+          handledSites,
+          readonlyModel,
+        )
+      : 0;
   const freeCallExtras = emitFreeCallFallback(
     graph,
     indexes,
     parsedFiles,
-    nodeLookup,
+    postHeritageNodeLookup,
     referenceIndex,
     handledSites,
     readonlyModel,
     workspaceIndex,
     {
       allowGlobalFallback: provider.allowGlobalFreeCallFallback === true,
+      constructorCallTargetsClass: provider.constructorCallTargetsClass === true,
       isFileLocalDef: provider.isFileLocalDef,
+      isCallableVisibleFromCaller: provider.isCallableVisibleFromCaller,
+      resolveAdlCandidates: provider.resolveAdlCandidates,
+      conversionRankFn: provider.conversionRankFn,
+      constraintCompatibility: provider.constraintCompatibility,
+      recordResolutionOutcome,
     },
   );
   const { emitted, skipped } = emitReferencesViaLookup(
     graph,
     indexes,
     referenceIndex,
-    nodeLookup,
+    postHeritageNodeLookup,
     handledSites,
   );
   const importsEmitted = emitImportEdges(
@@ -330,7 +492,8 @@ export function runScopeResolution(
     filesSkipped,
     importsEmitted,
     resolve: resolveStats,
-    referenceEdgesEmitted: emitted + receiverExtras + freeCallExtras,
+    referenceEdgesEmitted: emitted + receiverExtras + unresolvedReceiverExtras + freeCallExtras,
     referenceSkipped: skipped,
+    resolutionOutcomes,
   };
 }

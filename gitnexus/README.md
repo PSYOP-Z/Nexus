@@ -2,7 +2,7 @@
 
 **Graph-powered code intelligence for AI agents.** Index any codebase into a knowledge graph, then query it via MCP or CLI.
 
-Works with **Cursor**, **Claude Code**, **Codex**, **Windsurf**, **Cline**, **OpenCode**, and any MCP-compatible tool.
+Works with **Cursor**, **Claude Code**, **Antigravity** (Google), **Codex**, **Windsurf**, **Cline**, **OpenCode**, and any MCP-compatible tool.
 
 [![npm version](https://img.shields.io/npm/v/gitnexus.svg)](https://www.npmjs.com/package/gitnexus)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial-blue.svg)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
@@ -34,6 +34,7 @@ To configure MCP for your editor, run `npx gitnexus setup` once — or set it up
 |--------|-----|--------|---------------------|---------|
 | **Claude Code** | Yes | Yes | Yes (PreToolUse) | **Full** |
 | **Cursor** | Yes | Yes | Yes (postToolUse, [manual install](../gitnexus-cursor-integration/README.md#hook-install)) | **Full** |
+| **Antigravity** (Google) | Yes | Yes | Yes (AfterTool, [Gemini CLI hooks schema](https://geminicli.com/docs/hooks/reference/)) | **Full** |
 | **Codex** | Yes | Yes | — | MCP + Skills |
 | **Windsurf** | Yes | — | — | MCP |
 | **OpenCode** | Yes | Yes | — | MCP + Skills |
@@ -151,12 +152,14 @@ Your AI agent gets these tools automatically:
 ```bash
 gitnexus setup                   # Configure MCP for your editors (one-time)
 gitnexus analyze [path]          # Index a repository (or update stale index)
-gitnexus analyze --force         # Force full re-index
+gitnexus analyze --repair-fts    # Fast path: rebuild/verify only FTS indexes on existing index data
+gitnexus analyze --force         # Full rebuild: re-parse + graph rebuild + FTS rebuild
 gitnexus analyze --embeddings    # Enable embedding generation (slower, better search)
 gitnexus analyze --skip-agents-md  # Preserve custom AGENTS.md/CLAUDE.md gitnexus section edits
 gitnexus analyze --verbose       # Log skipped files when parsers are unavailable
 gitnexus analyze --max-file-size 1024  # Skip files larger than N KB (default: 512, cap: 32768)
 gitnexus analyze --worker-timeout 60  # Increase worker idle timeout for slow parses
+gitnexus analyze --wal-checkpoint-threshold 67108864  # 64 MiB. Control LadybugDB WAL auto-checkpoint threshold (default: 67108864 = 64 MiB; -1 keeps Ladybug stock ~16 MiB)
 gitnexus mcp                     # Start MCP server (stdio) — serves all indexed repos
 gitnexus serve                   # Start local HTTP server (multi-repo) for web UI
 gitnexus index                   # Register an existing .gitnexus/ folder into the global registry
@@ -166,6 +169,13 @@ gitnexus clean                   # Delete index for current repo
 gitnexus clean --all --force     # Delete all indexes
 gitnexus wiki [path]             # Generate LLM-powered docs from knowledge graph
 gitnexus wiki --model <model>    # Wiki with custom LLM model (default: gpt-4o-mini)
+
+# Direct graph queries — the same tools the MCP server exposes, no MCP daemon needed
+gitnexus query "<concept>"                                    # Process-grouped hybrid search
+gitnexus context <symbol> [--uid <uid> | --file <path>]       # 360° symbol view; flags disambiguate a shared name
+gitnexus impact <symbol> [--uid <uid> | --file <path> | --kind <kind>]  # Blast radius; flags disambiguate a shared name
+gitnexus detect-changes          # Map the working-tree diff to affected symbols and execution flows
+gitnexus cypher "<query>"        # Run a raw Cypher query against the knowledge graph
 
 # Repository groups (multi-repo / monorepo service tracking)
 gitnexus group create <name>                                   # Create a repository group
@@ -306,6 +316,7 @@ Configure the behavior with two environment variables:
 |----------|--------|---------|--------|
 | `GITNEXUS_LBUG_EXTENSION_INSTALL` | `auto`, `load-only`, `never` | `auto` | `auto` runs one bounded INSTALL if LOAD fails. `load-only` only uses already-installed extensions (recommended for offline / firewalled environments). `never` skips optional extensions entirely. |
 | `GITNEXUS_LBUG_EXTENSION_INSTALL_TIMEOUT_MS` | positive integer | `15000` | Wall-clock budget for the out-of-process `INSTALL` child before it is killed. |
+| `GITNEXUS_WAL_CHECKPOINT_THRESHOLD` | integer `>= -1` | `67108864` (64 MiB) | LadybugDB WAL auto-checkpoint threshold during analyze (bytes). Auto-checkpoint remains enabled; `-1` keeps Ladybug's stock ~16 MiB. Larger thresholds reduce checkpoint frequency but increase the WAL size at rotation time — choose a smaller value on disk-constrained environments. |
 
 ```bash
 # Offline/airgapped: never reach the network for extensions
@@ -357,6 +368,16 @@ npx gitnexus analyze
 ```
 
 For repositories with very large source files, `GITNEXUS_WORKER_SUB_BATCH_MAX_BYTES` controls the worker job byte budget. The default is **8388608 bytes (8 MB)**.
+
+### Worker pool resilience tuning
+
+Three env vars expose the pool's resilience layers (respawn budget, cumulative-timeout cap, circuit breaker). Defaults are tuned for typical repos; bump them when an analyze legitimately needs more retries, or lower them to fail-fast on a known-bad shape.
+
+| Variable                                          | Default                   | Effect                                                                                                                            |
+| ------------------------------------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `GITNEXUS_WORKER_MAX_RESPAWNS_PER_SLOT`            | `3`                       | Max replacement spawns per slot before the slot is dropped from the active rotation.                                              |
+| `GITNEXUS_WORKER_MAX_CUMULATIVE_TIMEOUT_MS`        | `5 × subBatchTimeoutMs`   | Total retry wall-time budget per job before quarantining. Bounds exponentially-growing retry waits.                              |
+| `GITNEXUS_WORKER_CONSECUTIVE_FAILURE_THRESHOLD`    | `max(3, poolSize)`        | Per-slot consecutive deaths before the pool's circuit breaker trips. After tripping, dispatches require a fresh pool.            |
 
 ## Privacy
 

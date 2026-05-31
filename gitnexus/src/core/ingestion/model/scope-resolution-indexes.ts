@@ -77,6 +77,16 @@ export interface ScopeResolutionIndexes {
    *  are returned first and win duplicate `def.nodeId` metadata, with
    *  unique augmentations appended after. See I8. */
   readonly bindingAugmentations: ReadonlyMap<ScopeId, ReadonlyMap<string, readonly BindingRef[]>>;
+  /** Workspace-level binding lookup, shared instead of per-scope
+   *  duplication. Consulted by `lookupBindingsAt` as a third source after
+   *  finalized and per-scope augmented bindings. Language-specific
+   *  namespace-sibling hooks populate it with disjoint key formats that
+   *  never collide — e.g. backslash-separated FQNs (`App\Models\User`) for
+   *  backslash-namespace languages, and bare simple names (`User`) for
+   *  global-/default-namespace types that are visible from every file. The
+   *  shared map gives those workspace-wide names one entry each instead of
+   *  O(scopes × defs) per-scope augmentation. */
+  readonly workspaceFqnBindings: ReadonlyMap<string, readonly BindingRef[]>;
   /** Pre-resolution usage facts; consumed by the resolution phase. */
   readonly referenceSites: readonly ReferenceSite[];
   /** SCC condensation of the file-level import graph — callers that want

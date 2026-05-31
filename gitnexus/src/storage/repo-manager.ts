@@ -11,6 +11,7 @@ import { realpathSync } from 'fs';
 import path from 'path';
 import os from 'os';
 import { getInferredRepoName, resolveRepoIdentityRoot } from './git.js';
+import { logger } from '../core/logger.js';
 
 /**
  * Normalise a repo path for registry comparison across platforms
@@ -287,14 +288,44 @@ export const findRepo = async (startPath: string): Promise<IndexedRepo | null> =
   return null;
 };
 
+function isReadOnlyFilesystemError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  return code === 'EROFS' || code === 'EACCES' || code === 'EPERM';
+}
+
 /**
  * Keep generated index files ignored without modifying the user's root .gitignore.
  */
 export const ensureGitNexusIgnored = async (repoPath: string): Promise<void> => {
   const gitignorePath = path.join(getStoragePath(repoPath), '.gitignore');
+  const desired = '*\n';
 
-  await fs.mkdir(path.dirname(gitignorePath), { recursive: true });
-  await fs.writeFile(gitignorePath, '*\n', 'utf-8');
+  // Idempotent fast path: skip the write entirely when the file already has
+  // the expected content. Lets this run cleanly on read-only mounts (e.g.
+  // the documented Docker workflow with WORKSPACE_DIR bound :ro) when an
+  // earlier `analyze` already created the file. See issue #1549.
+  try {
+    if ((await fs.readFile(gitignorePath, 'utf-8')) === desired) {
+      await ensureGitInfoExclude(repoPath);
+      return;
+    }
+  } catch (err: any) {
+    if (err?.code !== 'ENOENT') throw err;
+  }
+
+  try {
+    await fs.mkdir(path.dirname(gitignorePath), { recursive: true });
+    await fs.writeFile(gitignorePath, desired, 'utf-8');
+  } catch (err: any) {
+    if (isReadOnlyFilesystemError(err)) {
+      logger.warn(
+        { path: gitignorePath, code: err.code },
+        'GitNexus storage filesystem is not writable; skipping .gitnexus/.gitignore. Generated files may appear as untracked in this repo locally.',
+      );
+    } else {
+      throw err;
+    }
+  }
 
   await ensureGitInfoExclude(repoPath);
 };
@@ -310,8 +341,6 @@ const ensureGitInfoExclude = async (repoPath: string): Promise<void> => {
     return;
   }
 
-  await fs.mkdir(path.dirname(excludePath), { recursive: true });
-
   let content = '';
   try {
     content = await fs.readFile(excludePath, 'utf-8');
@@ -326,7 +355,19 @@ const ensureGitInfoExclude = async (repoPath: string): Promise<void> => {
   if (excludes.includes(GITNEXUS_DIR) || excludes.includes(GITNEXUS_EXCLUDE_ENTRY)) return;
 
   const separator = content.length === 0 || content.endsWith('\n') ? '' : '\n';
-  await fs.writeFile(excludePath, `${content}${separator}${GITNEXUS_EXCLUDE_ENTRY}\n`, 'utf-8');
+  try {
+    await fs.mkdir(path.dirname(excludePath), { recursive: true });
+    await fs.writeFile(excludePath, `${content}${separator}${GITNEXUS_EXCLUDE_ENTRY}\n`, 'utf-8');
+  } catch (err: any) {
+    if (isReadOnlyFilesystemError(err)) {
+      logger.warn(
+        { path: excludePath, code: err.code },
+        'GitNexus storage filesystem is not writable; skipping .git/info/exclude update. .gitnexus/ may appear as untracked in `git status` locally.',
+      );
+    } else {
+      throw err;
+    }
+  }
 };
 
 // ─── Global Registry (~/.gitnexus/registry.json) ───────────────────────
@@ -898,8 +939,10 @@ export interface CLIConfig {
   apiKey?: string;
   model?: string;
   baseUrl?: string;
-  provider?: 'openai' | 'openrouter' | 'azure' | 'custom' | 'cursor';
+  provider?: 'openai' | 'openrouter' | 'azure' | 'custom' | 'cursor' | 'claude' | 'codex';
   cursorModel?: string;
+  claudeModel?: string;
+  codexModel?: string;
   /** Azure api-version query param (e.g. '2024-10-21'). Only used when provider is 'azure'. */
   apiVersion?: string;
   /** Set true when the deployment is a reasoning model (o1, o3, o4-mini). Auto-detected for OpenAI; must be set for Azure deployments. */

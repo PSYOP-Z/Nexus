@@ -53,6 +53,10 @@
 
 import Parser from 'tree-sitter';
 import TS from 'tree-sitter-typescript';
+import {
+  ARRAY_METHOD_NOT_ANY_OF_PREDICATE,
+  DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE,
+} from '../../ts-js-hoc-utils.js';
 
 // tree-sitter-typescript exports both `typescript` and `tsx` grammars on
 // the default export. The package's `.d.ts` types the default export
@@ -250,20 +254,22 @@ const TYPESCRIPT_SCOPE_QUERY = `
 ;; that promotes the binding to the parent scope (where \`const X\`
 ;; lives).
 ;;
-;; Trade-off — chained array-method form: \`const x = arr.find((y) => p(y))\`
-;; has the same syntactic shape and would also match, naming the
-;; \`.find\` callback as \`x\`. The resulting \`Function:x\` is mostly
-;; harmless: \`x\` is consumed as a value (\`if (x) { ... }\`), never
-;; invoked as a function, so it gets zero incoming \`CALLS\` edges. The
-;; one outgoing edge \`Function:x → p\` is a minor mis-attribution that
-;; could in principle be fixed by adding a \`function: [(identifier)
-;; (member_expression)]\` predicate that excludes property-identifiers
-;; matching a known array-method blocklist (\`map\` / \`filter\` / \`find\`
-;; / \`reduce\` / \`forEach\` / \`some\` / \`every\`). We don't do that here
-;; because (a) the false-positive cost is negligible, (b) the blocklist
-;; would need maintenance, and (c) any user-defined fluent-API method
-;; with a callback argument would still false-positive — there's no
-;; clean syntactic line.
+;; #1876 — chained array-method form: \`const x = arr.find((y) => p(y))\`
+;; has the same syntactic shape and matches here too, naming the
+;; \`.find\` callback as \`x\`. Because \`x\` holds a value (the method
+;; result), not a callable, the spurious \`Function:x\` def is dropped
+;; emit-side in captures.ts: \`isArrayMethodCallbackArrow\` skips any
+;; \`@declaration.function\` whose enclosing call has a member-expression
+;; callee with a known Array-method property (\`ARRAY_CALLBACK_METHODS\`:
+;; \`map\` / \`filter\` / \`find\` / \`reduce\` / \`forEach\` / \`some\` /
+;; \`every\` / …). Only the \`@declaration.variable\` survives, so the
+;; binding is a single value def and calls inside the callback attribute
+;; to the enclosing scope rather than \`Function:x\`.
+;;
+;; Residual (intentional): a user-defined fluent-API method with a
+;; callback (\`qb.where(x => …)\`) is NOT in the blocklist and still
+;; classifies as \`Function\` — there's no clean syntactic line beyond
+;; the well-known Array surface, so the set is closed and easy to extend.
 ;;
 ;; Trade-off — multi-arrow arguments: \`const x = call(arrow1, arrow2)\`
 ;; would emit TWO matches with the same name \`x\`. tree-sitter-query
@@ -275,10 +281,16 @@ const TYPESCRIPT_SCOPE_QUERY = `
 ;; via \`(filePath, type, qualifiedName)\` — second wins. Acceptable;
 ;; multi-arrow-callback APIs are rare (\`new Promise(executor)\` is the
 ;; main one and takes a single executor).
+;;
+;; NOTE: Split into identifier vs member_expression patterns. Member
+;; expressions are filtered with a blocklist of common array methods
+;; (map, filter, reduce, etc.) to avoid false positives like
+;; \`const x = arr.map(a => ...)\` being classified as Function.
 (lexical_declaration
   (variable_declarator
     name: (identifier) @declaration.name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (arrow_function) @declaration.function))))
 
@@ -286,13 +298,35 @@ const TYPESCRIPT_SCOPE_QUERY = `
   (variable_declarator
     name: (identifier) @declaration.name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (function_expression) @declaration.function))))
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @declaration.name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @declaration.name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
 
 (variable_declaration
   (variable_declarator
     name: (identifier) @declaration.name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (arrow_function) @declaration.function))))
 
@@ -300,8 +334,63 @@ const TYPESCRIPT_SCOPE_QUERY = `
   (variable_declarator
     name: (identifier) @declaration.name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (function_expression) @declaration.function))))
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @declaration.name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @declaration.name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+;; HOC-wrapped default exports: \`export default defineEventHandler(async (e) => { ... })\`.
+;; The emit phase rewrites @declaration.name to a file-derived name so
+;; wrappers like \`defineEventHandler\` / \`React.memo\` do not collapse
+;; unrelated modules onto the same symbol name.
+((export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (arrow_function) @declaration.function)))
+  ${DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE})
+
+((export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (function_expression) @declaration.function)))
+  ${DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE})
+
+((export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (arrow_function) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+((export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (function_expression) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
 
 ;; Method definitions — regular + private (#field) methods.
 (method_definition
