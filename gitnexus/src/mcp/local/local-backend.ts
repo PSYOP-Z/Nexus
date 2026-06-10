@@ -8,6 +8,7 @@
 
 import fs from 'fs/promises';
 import path from 'path';
+import { createHash } from 'crypto';
 import {
   initLbug,
   executeQuery,
@@ -50,6 +51,7 @@ import {
 import { PhaseTimer } from '../../core/search/phase-timer.js';
 import { checkStalenessAsync, checkCwdMatch } from '../../core/git-staleness.js';
 import { logger } from '../../core/logger.js';
+import { LIST_REPOS_DEFAULT_LIMIT, LIST_REPOS_MAX_LIMIT } from '../tools.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -176,8 +178,34 @@ function logQueryError(context: string, err: unknown): void {
   logger.error({ context, err: msg }, 'GitNexus query failed');
 }
 
-const isReadOnlyDbError = (err: unknown): boolean =>
-  /read-only database/i.test(err instanceof Error ? err.message : String(err));
+/**
+ * A "missing table/label/relation" prepare error is benign for the query tool's
+ * best-effort enrichment: a repo analyzed without processes or communities simply
+ * has no `Process`/`Community` tables, so the `STEP_IN_PROCESS` / `MEMBER_OF`
+ * enrichment queries fail to prepare. That is a normal configuration, NOT a
+ * degraded result — it must not raise the `partial` flag (which callers would
+ * then learn to ignore). Real failures (timeouts, locks, native faults) do.
+ */
+function isBenignMissingTableError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /does not exist|no such (table|label|rel)|unknown (table|label)|not (defined|found)/i.test(
+    msg,
+  );
+}
+
+const isReadOnlyDbError = (err: unknown): boolean => {
+  // Walk the `cause` chain (bounded) so a wrapped read-only error (e.g. the
+  // pool adapter's `{ cause }` wrapper) is still detected here — this is the
+  // copy the MCP cypher handler uses to surface its curated read-only message
+  // (#2068 follow-up). Mirrors lbug-adapter's isReadOnlyDbError.
+  let cur: unknown = err;
+  for (let depth = 0; depth < 5 && cur != null; depth++) {
+    const msg = cur instanceof Error ? cur.message : String(cur);
+    if (/read-only database/i.test(msg)) return true;
+    cur = cur instanceof Error ? (cur as { cause?: unknown }).cause : undefined;
+  }
+  return false;
+};
 
 /**
  * Per-query latency telemetry for production aggregation (#553).
@@ -304,9 +332,16 @@ export function resolveWorktreeCwd(repoPath: string, launchCwd: string): string 
 }
 
 /**
- * Length of the base64url path hash appended to a colliding repo id.
+ * Length of the path-derived suffix appended to a colliding repo id.
  * Exported so tests can pin the suffix shape without re-deriving the
- * literal; see `repoId()` and the hashed-id resolution tier (#1658).
+ * literal; see `assignRepoId()` and the hashed-id resolution tier (#1658).
+ *
+ * Note: base64url is an *encoding*, not a hash — it preserves byte order, so
+ * two paths that share a long common prefix (sibling clones under one parent)
+ * collapse to the same sliced suffix. `assignRepoId()` keeps the legacy
+ * base64url suffix only for the first colliding duplicate (id compatibility)
+ * and falls back to a content hash of the resolved path on a real collision
+ * (#2054).
  */
 export const REPO_ID_HASH_LENGTH = 6;
 
@@ -323,6 +358,84 @@ interface ImpactParams {
   limit?: number;
   offset?: number;
   summaryOnly?: boolean;
+}
+
+/**
+ * One repository entry as returned by {@link LocalBackend.listRepos} and in each
+ * `list_repos` page. Named so the `listRepos`/`listReposPage` return types read
+ * clearly instead of an opaque `Awaited<ReturnType<…>>` expression.
+ */
+export interface RepoListing {
+  name: string;
+  path: string;
+  indexedAt: string;
+  lastCommit: string;
+  remoteUrl?: string;
+  stats?: any;
+  staleness?: { commitsBehind: number; hint?: string };
+  siblings?: Array<{ name: string; path: string; lastCommit: string }>;
+}
+
+/** Continuation metadata for the paginated `list_repos` MCP tool (#2119). */
+export interface ListReposPagination {
+  /** Total repositories across all pages. */
+  total: number;
+  /** Effective page size used (equals the requested limit; out-of-range is rejected, not clamped). */
+  limit: number;
+  /** Offset this page started at. */
+  offset: number;
+  /** Number of repositories actually returned in this page. */
+  returned: number;
+  /** True when more repositories remain past this page. */
+  hasMore: boolean;
+  /** Offset to request next; present only when `hasMore` is true. */
+  nextOffset?: number;
+}
+
+/**
+ * Validate and normalise `list_repos` pagination arguments.
+ *
+ * @internal Exported for unit testing; not part of the public API surface.
+ *
+ * There is NO MCP-SDK-level enforcement of a tool's advertised `inputSchema`
+ * (the SDK validates only the JSON-RPC envelope), and `callTool` is reachable
+ * directly, so the backend is the real validation boundary. Malformed values —
+ * non-number, `NaN`, non-integer, `limit < 1`, `limit > maxLimit`, or
+ * `offset < 0` — are REJECTED with a clear error. `limit` is bounded but NOT
+ * silently clamped: an over-max value throws (symmetric with the other bounds)
+ * so a client never receives a smaller page than it asked for without knowing.
+ * An omitted value (only `undefined`) falls back to the default.
+ */
+export function parseListReposPagination(
+  params: { limit?: unknown; offset?: unknown } | null | undefined,
+  opts: { defaultLimit: number; maxLimit: number },
+): { limit: number; offset: number } {
+  const requireInt = (value: unknown, field: string, min: number, max?: number): number => {
+    const valid =
+      typeof value === 'number' &&
+      Number.isInteger(value) &&
+      value >= min &&
+      (max === undefined || value <= max);
+    if (!valid) {
+      const bound = max === undefined ? `>= ${min}` : `between ${min} and ${max}`;
+      throw new Error(
+        `list_repos: "${field}" must be an integer ${bound} (received ${JSON.stringify(value)})`,
+      );
+    }
+    return value;
+  };
+
+  let limit = opts.defaultLimit;
+  if (params?.limit !== undefined) {
+    limit = requireInt(params.limit, 'limit', 1, opts.maxLimit);
+  }
+
+  let offset = 0;
+  if (params?.offset !== undefined) {
+    offset = requireInt(params.offset, 'offset', 0);
+  }
+
+  return { limit, offset };
 }
 
 export class LocalBackend {
@@ -388,11 +501,35 @@ export class LocalBackend {
    */
   private async refreshRepos(): Promise<void> {
     const entries = await listRegisteredRepos({ validate: true });
-    const freshIds = new Set<string>();
 
-    for (const entry of entries) {
-      const id = this.repoId(entry.name, entry.path);
-      freshIds.add(id);
+    // Build the next map from scratch and swap it in atomically. Mutating the
+    // live map in place let stale entries influence fresh id assignment: a
+    // bare-name id, once handed to the first registry entry, stuck to it across
+    // refreshes and reorders, and colliding path suffixes silently overwrote
+    // each other so sibling clones disappeared from `list_repos` (#2054).
+    const nextRepos = new Map<string, RepoHandle>();
+    const nextContext = new Map<string, CodebaseContext>();
+    const assigned = new Map<string, string>(); // id -> resolved repo path
+
+    // Assign ids over a path-sorted view so a registered clone always gets the
+    // same id regardless of the registry's on-disk order: the bare name and
+    // each path-derived suffix become a pure function of the resolved-path set,
+    // not of iteration order, so a memorized id can't drift to a different
+    // clone after a registry reorder (#2067 follow-up).
+    const ordered = [...entries].sort((a, b) => {
+      const ra = path.resolve(a.path);
+      const rb = path.resolve(b.path);
+      return ra < rb ? -1 : ra > rb ? 1 : 0;
+    });
+
+    for (const entry of ordered) {
+      // path.resolve (not canonicalizePath) matches the pre-#2054 collision
+      // check and keeps refreshRepos free of mockable deps on the hot init
+      // path. registerRepo writes path.resolve'd paths (not realpath), and
+      // resolveRepoFromCache canonicalizes both sides when matching by path, so
+      // keying id assignment on path.resolve here is consistent and correct.
+      const resolved = path.resolve(entry.path);
+      const id = this.assignRepoId(entry.name, entry.path, resolved, assigned);
 
       const storagePath = entry.storagePath;
       const lbugPath = path.join(storagePath, 'lbug');
@@ -418,11 +555,11 @@ export class LocalBackend {
         stats: entry.stats,
       };
 
-      this.repos.set(id, handle);
+      nextRepos.set(id, handle);
 
       // Build lightweight context (no LadybugDB needed)
       const s = entry.stats || {};
-      this.contextCache.set(id, {
+      nextContext.set(id, {
         projectName: entry.name,
         stats: {
           fileCount: s.files || 0,
@@ -434,37 +571,87 @@ export class LocalBackend {
       });
     }
 
-    // Prune repos that no longer exist in the registry
-    for (const id of this.repos.keys()) {
-      if (!freshIds.has(id)) {
-        this.repos.delete(id);
-        this.contextCache.delete(id);
-        this.initializedRepos.delete(id);
-      }
+    // Prune per-clone pool state for databases that are no longer registered.
+    // The LadybugDB pool and the init/staleness/reinit maps are keyed by the
+    // immutable lbugPath (see ensureInitialized), so a repo id that merely
+    // moves to a different clone needs NO eviction — distinct clones have
+    // distinct lbugPaths and can never share a pool entry, which is what closes
+    // the resolve→query wrong-clone window for good (#2067). Only a path that
+    // dropped out of the registry must release its pooled connection + state.
+    const liveLbugPaths = new Set([...nextRepos.values()].map((h) => h.lbugPath));
+    for (const prev of this.repos.values()) {
+      if (liveLbugPaths.has(prev.lbugPath)) continue;
+      this.initializedRepos.delete(prev.lbugPath);
+      this.lastStalenessCheck.delete(prev.lbugPath);
+      this.reinitPromises.delete(prev.lbugPath);
+      closeLbug(prev.lbugPath).catch(() => {});
     }
+
+    this.repos = nextRepos;
+    this.contextCache = nextContext;
   }
 
   /**
-   * Generate a stable repo ID from name + path.
-   * If names collide, append a hash of the path.
+   * Assign a collision-free in-memory id for a registered repo.
+   *
+   * - Unique name → the bare lowercased name.
+   * - Duplicate name → a path-derived suffix. The *first* colliding clone keeps
+   *   the legacy `base64url(path)` suffix so ids generated before #2054 still
+   *   resolve (the #1658 hashed-id tier). base64url is an encoding, not a hash:
+   *   it preserves byte order, so sibling clones under one parent (e.g.
+   *   `.../REPO_2` and `.../REPO_3`) yield identical leading characters and thus
+   *   the same sliced suffix. Any further collision therefore falls back to a
+   *   content hash of the *resolved* path (order-insensitive), extended
+   *   deterministically until unique.
+   *
+   * `assigned` maps every id handed out in this refresh to its resolved path,
+   * so a candidate is "free" when it is unused or already owned by this exact
+   * path. This method records its own assignment into `assigned` before
+   * returning, so the map-update is the function's invariant, not a caller
+   * obligation. A returned id never overwrites a different path's handle (#2054).
    */
-  private repoId(name: string, repoPath: string): string {
+  private assignRepoId(
+    name: string,
+    repoPath: string,
+    resolved: string,
+    assigned: Map<string, string>,
+  ): string {
     const base = name.toLowerCase();
-    // Check for name collision with a different path
-    for (const [id, handle] of this.repos) {
-      if (id === base && handle.repoPath !== path.resolve(repoPath)) {
-        // Collision — use path hash
-        // Lowercase the hash so it survives the `paramLower` lookup in
-        // resolveRepoFromCache — base64url retains mixed case, but the id
-        // tier compares against `repoParam.toLowerCase()` (#1658 follow-up).
-        const hash = Buffer.from(repoPath)
-          .toString('base64url')
-          .slice(0, REPO_ID_HASH_LENGTH)
-          .toLowerCase();
-        return `${base}-${hash}`;
-      }
+    const free = (id: string): boolean => {
+      const owner = assigned.get(id);
+      return owner === undefined || owner === resolved;
+    };
+    // Record the assignment so subsequent entries in the same refresh see this
+    // id as taken (the function owns its own invariant).
+    const claim = (id: string): string => {
+      assigned.set(id, resolved);
+      return id;
+    };
+
+    if (free(base)) return claim(base);
+
+    // Legacy suffix from the *raw* path — kept byte-for-byte so the first
+    // colliding duplicate keeps the id it had before #2054 (#1658 tier).
+    const legacy = `${base}-${Buffer.from(repoPath)
+      .toString('base64url')
+      .slice(0, REPO_ID_HASH_LENGTH)
+      .toLowerCase()}`;
+    if (free(legacy)) return claim(legacy);
+
+    // Real collision — hash the resolved path. Lowercase hex survives the
+    // `paramLower` lookup in resolveRepoFromCache.
+    const digest = createHash('sha256').update(resolved).digest('hex');
+    for (let len = REPO_ID_HASH_LENGTH; len <= digest.length; len++) {
+      const candidate = `${base}-${digest.slice(0, len)}`;
+      if (free(candidate)) return claim(candidate);
     }
-    return base;
+
+    // Two distinct resolved paths sharing a full SHA-256 digest is a hash
+    // break, not a runtime condition — fail loudly rather than silently
+    // overwrite a different repo's handle (#2054 invariant).
+    throw new Error(
+      `GitNexus internal: unable to assign a unique repo id for "${name}" at ${repoPath}`,
+    );
   }
 
   // ─── Repo Resolution ─────────────────────────────────────────────
@@ -648,43 +835,51 @@ export class LocalBackend {
 
   // ─── Lazy LadybugDB Init ────────────────────────────────────────────
 
-  private async ensureInitialized(repoId: string): Promise<void> {
+  /**
+   * Ensure the LadybugDB pool is open for the *resolved* repo.
+   *
+   * Takes the `RepoHandle` the caller resolved — NOT a bare id — and keys the
+   * pool (and the init/staleness/reinit maps) by the immutable `lbugPath`. Two
+   * things matter for multi-clone correctness: (1) the handle is the one the
+   * caller resolved, so a concurrent `refreshRepos` can't substitute a different
+   * clone; (2) the pool key is the database path, so distinct clones never share
+   * a pool entry even when their name-derived id transiently collides (#2067).
+   */
+  private async ensureInitialized(repo: RepoHandle): Promise<void> {
+    const poolKey = repo.lbugPath;
     // If a reinit is already in progress for this repo, wait for it
-    const pending = this.reinitPromises.get(repoId);
+    const pending = this.reinitPromises.get(poolKey);
     if (pending) return pending;
-
-    const handle = this.repos.get(repoId);
-    if (!handle) throw new Error(`Unknown repo: ${repoId}`);
 
     // Check if the index was rebuilt since we opened the connection (#297).
     // Throttle staleness checks to at most once per 5 seconds per repo to
     // avoid an fs.readFile round-trip on every tool invocation.
-    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) {
+    if (this.initializedRepos.has(poolKey) && isLbugReady(poolKey)) {
       const now = Date.now();
-      const lastCheck = this.lastStalenessCheck.get(repoId) ?? 0;
+      const lastCheck = this.lastStalenessCheck.get(poolKey) ?? 0;
       if (now - lastCheck < 5000) return; // Checked recently — skip
 
-      this.lastStalenessCheck.set(repoId, now);
+      this.lastStalenessCheck.set(poolKey, now);
       try {
-        const metaPath = path.join(handle.storagePath, 'meta.json');
+        const metaPath = path.join(repo.storagePath, 'meta.json');
         const metaRaw = await fs.readFile(metaPath, 'utf-8');
         const meta = JSON.parse(metaRaw);
-        if (meta.indexedAt && meta.indexedAt !== handle.indexedAt) {
+        if (meta.indexedAt && meta.indexedAt !== repo.indexedAt) {
           // Index was rebuilt — close stale connection and re-init.
           // Wrap in reinitPromises to prevent TOCTOU race where concurrent
           // callers both detect staleness and double-close the pool.
           const reinit = (async () => {
             try {
-              await closeLbug(repoId);
-              this.initializedRepos.delete(repoId);
-              handle.indexedAt = meta.indexedAt;
-              await initLbug(repoId, handle.lbugPath);
-              this.initializedRepos.add(repoId);
+              await closeLbug(poolKey);
+              this.initializedRepos.delete(poolKey);
+              repo.indexedAt = meta.indexedAt;
+              await initLbug(poolKey, repo.lbugPath);
+              this.initializedRepos.add(poolKey);
             } finally {
-              this.reinitPromises.delete(repoId);
+              this.reinitPromises.delete(poolKey);
             }
           })();
-          this.reinitPromises.set(repoId, reinit);
+          this.reinitPromises.set(poolKey, reinit);
           return reinit;
         } else {
           return; // Pool is current
@@ -695,11 +890,11 @@ export class LocalBackend {
     }
 
     try {
-      await initLbug(repoId, handle.lbugPath);
-      this.initializedRepos.add(repoId);
+      await initLbug(poolKey, repo.lbugPath);
+      this.initializedRepos.add(poolKey);
     } catch (err: any) {
       // If lock error, mark as not initialized so next call retries
-      this.initializedRepos.delete(repoId);
+      this.initializedRepos.delete(poolKey);
       throw err;
     }
   }
@@ -732,18 +927,7 @@ export class LocalBackend {
    *     that another clone of the same logical repo is registered).
    *   - `remoteUrl`: the canonical origin URL recorded at index time.
    */
-  async listRepos(): Promise<
-    Array<{
-      name: string;
-      path: string;
-      indexedAt: string;
-      lastCommit: string;
-      remoteUrl?: string;
-      stats?: any;
-      staleness?: { commitsBehind: number; hint?: string };
-      siblings?: Array<{ name: string; path: string; lastCommit: string }>;
-    }>
-  > {
+  async listRepos(): Promise<RepoListing[]> {
     await this.refreshRepos();
     const handles = [...this.repos.values()];
 
@@ -795,6 +979,58 @@ export class LocalBackend {
             : undefined,
       };
     });
+  }
+
+  /**
+   * Paginated view over {@link listRepos} for the `list_repos` MCP tool (#2119).
+   *
+   * `listRepos()` itself still returns the FULL array — its resource and CLI
+   * consumers (`gitnexus://repos`, `gitnexus://setup`, startup logs) need every
+   * entry, so pagination lives ONLY here, on the tool surface, to keep the
+   * response under MCP/LLM token-truncation limits.
+   *
+   * Determinism: a single registry snapshot is taken per call, then sorted by
+   * lower-cased name with the repository path as a tie-breaker. Sibling clones
+   * share a name but never a path (#2054), so `(name, path)` is a total order —
+   * paging never skips or duplicates an entry while the registry is unchanged.
+   * Codepoint comparison (not `localeCompare`) keeps page boundaries stable
+   * across machines/locales, matching the existing `refreshRepos` ordering.
+   */
+  async listReposPage(params?: { limit?: unknown; offset?: unknown } | null): Promise<{
+    repositories: RepoListing[];
+    pagination: ListReposPagination;
+  }> {
+    const { limit, offset } = parseListReposPagination(params, {
+      defaultLimit: LIST_REPOS_DEFAULT_LIMIT,
+      maxLimit: LIST_REPOS_MAX_LIMIT,
+    });
+
+    // One consistent snapshot per call (listRepos refreshes the registry once),
+    // sorted into a stable total order before slicing.
+    const all = await this.listRepos();
+    all.sort((a, b) => {
+      const an = a.name.toLowerCase();
+      const bn = b.name.toLowerCase();
+      if (an !== bn) return an < bn ? -1 : 1;
+      return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+    });
+
+    const total = all.length;
+    const repositories = all.slice(offset, offset + limit);
+    const returned = repositories.length;
+    const hasMore = offset + returned < total;
+
+    return {
+      repositories,
+      pagination: {
+        total,
+        limit,
+        offset,
+        returned,
+        hasMore,
+        ...(hasMore && { nextOffset: offset + returned }),
+      },
+    };
   }
 
   /**
@@ -858,7 +1094,10 @@ export class LocalBackend {
 
   async callTool(method: string, params: any): Promise<any> {
     if (method === 'list_repos') {
-      return this.listRepos();
+      // Paginated tool surface (#2119). `listRepos()` is unchanged for internal
+      // callers; the tool wraps it in { repositories, pagination } and forwards
+      // the limit/offset args that this dispatch previously discarded.
+      return this.listReposPage(params);
     }
 
     if (method.startsWith('group_')) {
@@ -937,7 +1176,7 @@ export class LocalBackend {
       return { error: 'query parameter is required and cannot be empty.' };
     }
 
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const processLimit = params.limit || 5;
     const maxSymbolsPerProcess = params.max_symbols || 10;
@@ -1018,6 +1257,112 @@ export class LocalBackend {
     >();
     const definitions: any[] = []; // standalone symbols not in any process
 
+    // Batch-fetch process participation, cohesion, and (optionally) content for
+    // ALL matched symbols in 2-3 graph queries instead of 2-3 *per symbol*. The
+    // previous per-symbol loop issued up to 3N sequential pool round-trips
+    // (searchLimit symbols × {STEP_IN_PROCESS, MEMBER_OF, content}); on a warm
+    // repo the IPC + query-setup overhead of those round-trips dominated query
+    // latency. Collapsing to `WHERE n.id IN $nodeIds` preserves identical output
+    // (the aggregation loop below is unchanged) while cutting the round-trips.
+    // Array params bind through the pool exactly as bm25Search's
+    // `WHERE n.id IN $nodeIds` already does. (Ported from gitnexus-enterprise
+    // PR #222 — N+1 → 2-3 batched queries.)
+    const nodeIds = merged.map(([, m]) => m.data?.nodeId).filter((id): id is string => !!id);
+
+    const processRowsByNode = new Map<string, any[]>();
+    const cohesionByNode = new Map<string, { cohesion: number; module?: string }>();
+    const contentByNode = new Map<string, string>();
+    // Set when a batched enrichment query throws a REAL failure (timeout, lock,
+    // native fault) — NOT the benign "no Process/Community table" case, which is
+    // a normal config (a repo analyzed without processes/communities) and must
+    // not raise a `partial` flag callers would learn to ignore. See
+    // isBenignMissingTableError + the response build below.
+    let enrichmentDegraded = false;
+
+    // Chunk the IN-list like the impact path (CHUNK_SIZE=100) so a large result
+    // set never builds an unbounded `IN` parameter. Default batch is
+    // processLimit*maxSymbolsPerProcess (≤ one chunk), but chunk for robustness.
+    const QUERY_CHUNK_SIZE = 100;
+    for (let i = 0; i < nodeIds.length; i += QUERY_CHUNK_SIZE) {
+      const ids = nodeIds.slice(i, i + QUERY_CHUNK_SIZE);
+
+      // Processes each symbol participates in. `n.id AS nodeId` is prepended as
+      // column 0 so rows from many symbols can be re-associated to their symbol.
+      try {
+        const rows = await executeParameterized(
+          repo.lbugPath,
+          `
+          MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+          WHERE n.id IN $nodeIds
+          RETURN n.id AS nodeId, p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
+        `,
+          { nodeIds: ids },
+        );
+        for (const row of rows) {
+          const nid = row.nodeId ?? row[0];
+          let list = processRowsByNode.get(nid);
+          if (!list) processRowsByNode.set(nid, (list = []));
+          list.push(row);
+        }
+      } catch (e) {
+        logQueryError('query:process-lookup', e);
+        if (!isBenignMissingTableError(e)) enrichmentDegraded = true;
+      }
+
+      // Cluster membership + cohesion. Keep the FIRST community row per node to
+      // mirror the prior per-symbol `LIMIT 1` (each symbol keeps ITS community,
+      // not one community for the whole batch).
+      try {
+        const rows = await executeParameterized(
+          repo.lbugPath,
+          `
+          MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+          WHERE n.id IN $nodeIds
+          RETURN n.id AS nodeId, c.cohesion AS cohesion, c.heuristicLabel AS module
+        `,
+          { nodeIds: ids },
+        );
+        for (const row of rows) {
+          const nid = row.nodeId ?? row[0];
+          if (!cohesionByNode.has(nid)) {
+            cohesionByNode.set(nid, {
+              cohesion: (row.cohesion ?? row[1]) || 0,
+              module: row.module ?? row[2],
+            });
+          }
+        }
+      } catch (e) {
+        logQueryError('query:cluster-info', e);
+        if (!isBenignMissingTableError(e)) enrichmentDegraded = true;
+      }
+
+      // Optionally fetch content for every matched symbol.
+      if (includeContent) {
+        try {
+          const rows = await executeParameterized(
+            repo.lbugPath,
+            `
+            MATCH (n)
+            WHERE n.id IN $nodeIds
+            RETURN n.id AS nodeId, n.content AS content
+          `,
+            { nodeIds: ids },
+          );
+          for (const row of rows) {
+            const nid = row.nodeId ?? row[0];
+            contentByNode.set(nid, row.content ?? row[1]);
+          }
+        } catch (e) {
+          logQueryError('query:content-fetch', e);
+          if (!isBenignMissingTableError(e)) enrichmentDegraded = true;
+        }
+      }
+    }
+
+    // Aggregation is unchanged from the per-symbol version — it now reads the
+    // pre-fetched maps instead of issuing a query per symbol. Iterating `merged`
+    // in the same (sorted) order preserves processMap insertion order, the
+    // definitions order, and the item.score association exactly.
     for (const [_, item] of merged) {
       const sym = item.data;
       if (!sym.nodeId) {
@@ -1030,61 +1375,11 @@ export class LocalBackend {
         continue;
       }
 
-      // Find processes this symbol participates in
-      let processRows: any[] = [];
-      try {
-        processRows = await executeParameterized(
-          repo.id,
-          `
-          MATCH (n {id: $nodeId})-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-          RETURN p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
-        `,
-          { nodeId: sym.nodeId },
-        );
-      } catch (e) {
-        logQueryError('query:process-lookup', e);
-      }
-
-      // Get cluster membership + cohesion (cohesion used as internal ranking signal)
-      let cohesion = 0;
-      let module: string | undefined;
-      try {
-        const cohesionRows = await executeParameterized(
-          repo.id,
-          `
-          MATCH (n {id: $nodeId})-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          RETURN c.cohesion AS cohesion, c.heuristicLabel AS module
-          LIMIT 1
-        `,
-          { nodeId: sym.nodeId },
-        );
-        if (cohesionRows.length > 0) {
-          cohesion = (cohesionRows[0].cohesion ?? cohesionRows[0][0]) || 0;
-          module = cohesionRows[0].module ?? cohesionRows[0][1];
-        }
-      } catch (e) {
-        logQueryError('query:cluster-info', e);
-      }
-
-      // Optionally fetch content
-      let content: string | undefined;
-      if (includeContent) {
-        try {
-          const contentRows = await executeParameterized(
-            repo.id,
-            `
-            MATCH (n {id: $nodeId})
-            RETURN n.content AS content
-          `,
-            { nodeId: sym.nodeId },
-          );
-          if (contentRows.length > 0) {
-            content = contentRows[0].content ?? contentRows[0][0];
-          }
-        } catch (e) {
-          logQueryError('query:content-fetch', e);
-        }
-      }
+      const processRows = processRowsByNode.get(sym.nodeId) ?? [];
+      const coh = cohesionByNode.get(sym.nodeId);
+      const cohesion = coh?.cohesion ?? 0;
+      const module = coh?.module;
+      const content = includeContent ? contentByNode.get(sym.nodeId) : undefined;
 
       const symbolEntry = {
         id: sym.nodeId,
@@ -1103,12 +1398,13 @@ export class LocalBackend {
       } else {
         // Add to each process it belongs to
         for (const row of processRows) {
-          const pid = row.pid ?? row[0];
-          const label = row.label ?? row[1];
-          const hLabel = row.heuristicLabel ?? row[2];
-          const pType = row.processType ?? row[3];
-          const stepCount = row.stepCount ?? row[4];
-          const step = row.step ?? row[5];
+          // Positional fallbacks shift +1 because `n.id AS nodeId` is column 0.
+          const pid = row.pid ?? row[1];
+          const label = row.label ?? row[2];
+          const hLabel = row.heuristicLabel ?? row[3];
+          const pType = row.processType ?? row[4];
+          const stepCount = row.stepCount ?? row[5];
+          const step = row.step ?? row[6];
 
           if (!processMap.has(pid)) {
             processMap.set(pid, {
@@ -1182,15 +1478,29 @@ export class LocalBackend {
     const timing = timer.summary();
     logQueryTiming(searchQuery, timing);
 
+    // Compose a single `warning` from all degraded conditions (FTS-missing
+    // and/or a real enrichment failure) so neither overwrites the other, and
+    // flag `partial` when enrichment was lost. Both are omitted on the clean
+    // path, leaving the success-path response shape byte-identical.
+    const warnings: string[] = [];
+    if (!ftsUsed) {
+      warnings.push(
+        'FTS indexes missing — keyword search degraded. Run: gitnexus analyze --repair-fts (or gitnexus analyze --force) to rebuild indexes.',
+      );
+    }
+    if (enrichmentDegraded) {
+      warnings.push(
+        'Symbol enrichment partially failed — some process/cohesion/content data may be missing from these results (see server logs).',
+      );
+    }
+
     return {
       processes,
       process_symbols: dedupedSymbols,
       definitions: definitions.slice(0, 20), // cap standalone definitions
       timing,
-      ...(!ftsUsed && {
-        warning:
-          'FTS indexes missing — keyword search degraded. Run: gitnexus analyze --repair-fts (or gitnexus analyze --force) to rebuild indexes.',
-      }),
+      ...(warnings.length > 0 && { warning: warnings.join(' ') }),
+      ...(enrichmentDegraded && { partial: true }),
     };
   }
 
@@ -1215,7 +1525,7 @@ export class LocalBackend {
     }
     let ftsResponse;
     try {
-      ftsResponse = await searchFTSFromLbug(query, limit, repo.id);
+      ftsResponse = await searchFTSFromLbug(query, limit, repo.lbugPath);
     } catch (err: any) {
       logger.error(
         { err: err.message },
@@ -1240,7 +1550,7 @@ export class LocalBackend {
         const nodeIds = bm25Result.nodeIds?.length ? bm25Result.nodeIds : null;
         const symbols = nodeIds
           ? await executeParameterized(
-              repo.id,
+              repo.lbugPath,
               `
               MATCH (n)
               WHERE n.id IN $nodeIds
@@ -1249,7 +1559,7 @@ export class LocalBackend {
               { nodeIds },
             )
           : await executeParameterized(
-              repo.id,
+              repo.lbugPath,
               `
               MATCH (n)
               WHERE n.filePath = $filePath
@@ -1301,7 +1611,7 @@ export class LocalBackend {
     try {
       // Check if embedding table exists before loading the model (avoids heavy model init when embeddings are off)
       const tableCheck = await executeQuery(
-        repo.id,
+        repo.lbugPath,
         `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN COUNT(*) AS cnt LIMIT 1`,
       );
       if (!tableCheck.length || (tableCheck[0].cnt ?? tableCheck[0][0]) === 0) return [];
@@ -1329,7 +1639,7 @@ export class LocalBackend {
             ORDER BY distance
           `;
 
-            const embResults = await executeQuery(repo.id, vectorQuery);
+            const embResults = await executeQuery(repo.lbugPath, vectorQuery);
             return embResults.map((row) => ({
               nodeId: row.nodeId ?? row[0],
               chunkIndex: row.chunkIndex ?? row[1] ?? 0,
@@ -1358,7 +1668,7 @@ export class LocalBackend {
         if (embeddingCount > exactLimit) return [];
 
         const rows = await executeQuery(
-          repo.id,
+          repo.lbugPath,
           `
           MATCH (e:${EMBEDDING_TABLE_NAME})
           RETURN e.nodeId AS nodeId, e.chunkIndex AS chunkIndex,
@@ -1402,7 +1712,7 @@ export class LocalBackend {
               ? `MATCH (n:File {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath`
               : `MATCH (n:\`${label}\` {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath`;
 
-          const nodeRows = await executeParameterized(repo.id, nodeQuery, { nodeId });
+          const nodeRows = await executeParameterized(repo.lbugPath, nodeQuery, { nodeId });
           if (nodeRows.length > 0) {
             const nodeRow = nodeRows[0];
             results.push({
@@ -1438,9 +1748,9 @@ export class LocalBackend {
     repo: RepoHandle,
     request: { query: string; params?: Record<string, unknown> },
   ): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
-    if (!isLbugReady(repo.id)) {
+    if (!isLbugReady(repo.lbugPath)) {
       return { error: 'LadybugDB not ready. Index may be corrupted.' };
     }
     if (request.params !== undefined && !isValidQueryParams(request.params)) {
@@ -1450,7 +1760,7 @@ export class LocalBackend {
     }
 
     try {
-      const result = await executeParameterized(repo.id, request.query, request.params ?? {});
+      const result = await executeParameterized(repo.lbugPath, request.query, request.params ?? {});
       return result;
     } catch (err: any) {
       const msg = err.message || 'Query failed';
@@ -1556,7 +1866,7 @@ export class LocalBackend {
     repo: RepoHandle,
     params: { showClusters?: boolean; showProcesses?: boolean; limit?: number },
   ): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const limit = params.limit || 20;
     const result: any = {
@@ -1572,7 +1882,7 @@ export class LocalBackend {
         // Fetch more raw communities than the display limit so aggregation has enough data
         const rawLimit = Math.max(limit * 5, 200);
         const clusters = await executeQuery(
-          repo.id,
+          repo.lbugPath,
           `
           MATCH (c:Community)
           RETURN c.id AS id, c.label AS label, c.heuristicLabel AS heuristicLabel, c.cohesion AS cohesion, c.symbolCount AS symbolCount
@@ -1596,7 +1906,7 @@ export class LocalBackend {
     if (params.showProcesses !== false) {
       try {
         const processes = await executeQuery(
-          repo.id,
+          repo.lbugPath,
           `
           MATCH (p:Process)
           RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
@@ -1640,7 +1950,7 @@ export class LocalBackend {
     if (ids.length === 0) return;
     try {
       const rows = await executeParameterized(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (n:\`Class\`) WHERE n.id IN $ids RETURN n.id AS id, 'Class' AS label
         UNION ALL
@@ -1763,7 +2073,7 @@ export class LocalBackend {
     // Direct UID — zero-ambiguity path.
     if (uid) {
       const rows = await executeParameterized(
-        repo.id,
+        repo.lbugPath,
         `MATCH (n {id: $uid}) RETURN ${selectClause} LIMIT 1`,
         { uid },
       );
@@ -1802,7 +2112,7 @@ export class LocalBackend {
     // LIMIT 20 (was 10) — scoring is the point now, so give the ranker
     // headroom instead of arbitrary truncation.
     const rows = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `MATCH (n) ${whereClause} RETURN ${selectClause} LIMIT 20`,
       queryParams,
     );
@@ -1842,7 +2152,7 @@ export class LocalBackend {
         const candidateIds = normalized.map((s) => s.id).filter(Boolean);
         for (const label of ['Class', 'Interface']) {
           const labelRows = await executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `MATCH (n:\`${label}\`) WHERE n.id IN $candidateIds RETURN n.id AS id LIMIT 1`,
             { candidateIds },
           ).catch(() => []);
@@ -1945,7 +2255,7 @@ export class LocalBackend {
       include_content?: boolean;
     },
   ): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const { name, uid, file_path, kind, include_content } = params;
 
@@ -1985,7 +2295,7 @@ export class LocalBackend {
 
     // Categorized incoming refs
     const incomingRows = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `
       MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
       WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
@@ -2010,7 +2320,7 @@ export class LocalBackend {
       try {
         // Single UNION query instead of two serial round-trips.
         const typeCheck = await executeParameterized(
-          repo.id,
+          repo.lbugPath,
           `
           MATCH (n:Class) WHERE n.id = $symId RETURN 'Class' AS label LIMIT 1
           UNION ALL
@@ -2032,7 +2342,7 @@ export class LocalBackend {
         const [ctorIncoming, fileIncoming, typedPropertyIncoming, typedProperties] =
           await Promise.all([
             executeParameterized(
-              repo.id,
+              repo.lbugPath,
               `
             MATCH (n)-[hm:CodeRelation]->(ctor:Constructor)
             WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
@@ -2044,7 +2354,7 @@ export class LocalBackend {
               { symId },
             ),
             executeParameterized(
-              repo.id,
+              repo.lbugPath,
               `
             MATCH (f:File)-[rel:CodeRelation]->(n)
             WHERE n.id = $symId AND rel.type = 'DEFINES'
@@ -2056,7 +2366,7 @@ export class LocalBackend {
               { symId },
             ),
             executeParameterized(
-              repo.id,
+              repo.lbugPath,
               `
             MATCH (p:\`Property\`)
             WHERE p.declaredType = $name
@@ -2074,7 +2384,7 @@ export class LocalBackend {
               },
             ),
             executeParameterized(
-              repo.id,
+              repo.lbugPath,
               `
             MATCH (p:\`Property\`)
             WHERE p.declaredType = $name
@@ -2113,7 +2423,7 @@ export class LocalBackend {
 
     // Categorized outgoing refs
     const outgoingRows = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `
       MATCH (n {id: $symId})-[r:CodeRelation]->(target)
       WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
@@ -2127,7 +2437,7 @@ export class LocalBackend {
     let processRows: any[] = [];
     try {
       processRows = await executeParameterized(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (n {id: $symId})-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
         RETURN p.id AS pid, p.heuristicLabel AS label, r.step AS step, p.stepCount AS stepCount
@@ -2163,7 +2473,7 @@ export class LocalBackend {
     if (isMethodLike) {
       try {
         const metaRows = await executeParameterized(
-          repo.id,
+          repo.lbugPath,
           `
           MATCH (n {id: $symId})
           RETURN n.visibility AS visibility, n.isStatic AS isStatic, n.isAbstract AS isAbstract,
@@ -2233,7 +2543,7 @@ export class LocalBackend {
     repo: RepoHandle,
     params: { name: string; type: 'symbol' | 'cluster' | 'process' },
   ): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
     const { name, type } = params;
 
     if (type === 'symbol') {
@@ -2242,7 +2552,7 @@ export class LocalBackend {
 
     if (type === 'cluster') {
       const clusters = await executeParameterized(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (c:Community)
         WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
@@ -2269,7 +2579,7 @@ export class LocalBackend {
       }
 
       const members = await executeParameterized(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
         WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
@@ -2298,7 +2608,7 @@ export class LocalBackend {
 
     if (type === 'process') {
       const processes = await executeParameterized(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (p:Process)
         WHERE p.label = $processName OR p.heuristicLabel = $processName
@@ -2312,7 +2622,7 @@ export class LocalBackend {
       const proc = processes[0];
       const procId = proc.id || proc[0];
       const steps = await executeParameterized(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: $procId})
         RETURN n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, r.step AS step
@@ -2353,7 +2663,7 @@ export class LocalBackend {
       worktree?: string;
     },
   ): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const scope = params.scope || 'unstaged';
     const { execFileSync } = await import('child_process');
@@ -2472,7 +2782,7 @@ export class LocalBackend {
       `;
 
       try {
-        const rows = await executeParameterized(repo.id, symbolQuery, queryParams);
+        const rows = await executeParameterized(repo.lbugPath, symbolQuery, queryParams);
         for (const sym of rows) {
           changedSymbols.push({
             id: sym.id || sym[0],
@@ -2494,7 +2804,7 @@ export class LocalBackend {
       const symNameById = new Map(changedSymbols.map((s) => [s.id, s.name]));
       try {
         const procs = await executeParameterized(
-          repo.id,
+          repo.lbugPath,
           `
           MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
           WHERE n.id IN $ids
@@ -2562,7 +2872,7 @@ export class LocalBackend {
       dry_run?: boolean;
     },
   ): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const { new_name, file_path } = params;
     const dry_run = params.dry_run ?? true;
@@ -2790,7 +3100,7 @@ export class LocalBackend {
   }
 
   private async _impactImpl(repo: RepoHandle, params: ImpactParams): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const { target, direction } = params;
     const maxDepth = params.maxDepth || 3;
@@ -2955,7 +3265,7 @@ export class LocalBackend {
         // Run both seed queries in parallel — they are independent.
         const [ctorRows, fileRows] = await Promise.all([
           executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `
             MATCH (n)-[hm:CodeRelation]->(c:Constructor)
             WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
@@ -2966,7 +3276,7 @@ export class LocalBackend {
           // Restrict to DEFINES edges only — other File->Class edge types (if
           // any) should not be treated as the owning file relationship.
           executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `
             MATCH (f:File)-[rel:CodeRelation]->(n)
             WHERE n.id = $symId AND rel.type = 'DEFINES'
@@ -2992,7 +3302,7 @@ export class LocalBackend {
         }
 
         const typedPropertyRows = await executeParameterized(
-          repo.id,
+          repo.lbugPath,
           `
           MATCH (p:\`Property\`)
           WHERE p.declaredType = $name
@@ -3030,7 +3340,7 @@ export class LocalBackend {
           : `MATCH (n)-[r:CodeRelation]->(callee) WHERE n.id IN $frontierIds AND r.type IN $relTypes${confidenceFilter} RETURN n.id AS sourceId, callee.id AS id, callee.name AS name, labels(callee)[0] AS type, callee.filePath AS filePath, r.type AS relType, r.confidence AS confidence`;
 
       try {
-        const related = await executeParameterized(repo.id, query, {
+        const related = await executeParameterized(repo.lbugPath, query, {
           frontierIds: frontier,
           relTypes: relationTypes,
           ...(safeMinConfidence > 0 ? { minConfidence: safeMinConfidence } : {}),
@@ -3137,7 +3447,7 @@ export class LocalBackend {
         try {
           // Use parameterized list to avoid building long query strings
           const rows = await executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `
             MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
             WHERE s.id IN $ids
@@ -3211,7 +3521,7 @@ export class LocalBackend {
           const pIds = Array.from(processesMissingMinStep);
           const allImpactedIds = impacted.map((it) => String(it.id ?? ''));
           const missingRows = await executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `
             MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
             WHERE p.id IN $pIds AND s.id IN $ids
@@ -3271,7 +3581,7 @@ export class LocalBackend {
         if (!idsChunk || idsChunk.length === 0) return;
         try {
           const rows = await executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `
             MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
             WHERE s.id IN $ids
@@ -3304,7 +3614,7 @@ export class LocalBackend {
         if (!idsChunk || idsChunk.length === 0) return;
         try {
           const rows = await executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `
             MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
             WHERE s.id IN $ids
@@ -3442,7 +3752,7 @@ export class LocalBackend {
         const chunkIds = pageIdArr.slice(i, i + CHUNK_SIZE);
         try {
           const rows = await executeParameterized(
-            repo.id,
+            repo.lbugPath,
             `
             MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
             WHERE s.id IN $ids
@@ -3515,22 +3825,24 @@ export class LocalBackend {
     // scope — the caller's Promise.race against the same signal
     // resolves the await regardless of how long this body runs.
     if (opts.signal?.aborted) return null;
+    let repo: RepoHandle | undefined;
     try {
       await this.refreshRepos();
-      await this.ensureInitialized(repoId);
+      // Fetch the resolved handle BEFORE init and pass it through, so a
+      // concurrent refresh can't remap the id to a different clone (#2067).
+      repo = this.repos.get(repoId);
+      if (repo) await this.ensureInitialized(repo);
     } catch {
       return null;
     }
-
-    const repo = this.repos.get(repoId);
-    if (!repo) return null;
+    if (!repo) return null; // unknown repo → null (preserves contract)
 
     const dir: 'upstream' | 'downstream' = direction === 'downstream' ? 'downstream' : 'upstream';
 
     let rows: any[];
     try {
       rows = await executeParameterized(
-        repoId,
+        repo.lbugPath, // pool keyed by the resolved clone's path, not the id
         `MATCH (n) WHERE n.id = $uid
          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, labels(n)[0] AS type
          LIMIT 1`,
@@ -3900,11 +4212,11 @@ export class LocalBackend {
   }
 
   private async routeMap(repo: RepoHandle, params: { route?: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const routeFilter = params.route ? `AND n.name CONTAINS $route` : '';
     const queryParams = params.route ? { route: params.route } : {};
-    const routes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
+    const routes = await this.fetchRoutesWithConsumers(repo.lbugPath, routeFilter, queryParams);
 
     if (routes.length === 0) {
       return {
@@ -3917,7 +4229,7 @@ export class LocalBackend {
     }
 
     const flowMap = await this.fetchLinkedFlowsBatch(
-      repo.id,
+      repo.lbugPath,
       routes.map((r) => r.id),
     );
 
@@ -3934,11 +4246,11 @@ export class LocalBackend {
   }
 
   private async shapeCheck(repo: RepoHandle, params: { route?: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const routeFilter = params.route ? `AND n.name CONTAINS $route` : '';
     const queryParams = params.route ? { route: params.route } : {};
-    const allRoutes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
+    const allRoutes = await this.fetchRoutesWithConsumers(repo.lbugPath, routeFilter, queryParams);
 
     const results = allRoutes
       .filter(
@@ -4016,13 +4328,13 @@ export class LocalBackend {
   }
 
   private async toolMap(repo: RepoHandle, params: { tool?: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const toolFilter = params.tool ? `AND n.name CONTAINS $tool` : '';
     const queryParams = params.tool ? { tool: params.tool } : {};
 
     const rows = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `
       MATCH (n:Tool)
       WHERE n.id STARTS WITH 'Tool:' ${toolFilter}
@@ -4040,7 +4352,7 @@ export class LocalBackend {
     }
 
     const toolIds = rows.map((r: any) => r.id ?? r[0]);
-    const flowMap = await this.fetchLinkedFlowsBatch(repo.id, toolIds);
+    const flowMap = await this.fetchLinkedFlowsBatch(repo.lbugPath, toolIds);
 
     return {
       tools: rows.map((r: any) => {
@@ -4060,7 +4372,7 @@ export class LocalBackend {
     repo: RepoHandle,
     params: { route?: string; file?: string },
   ): Promise<any> {
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     if (!params.route && !params.file) {
       return { error: 'Either "route" or "file" parameter is required.' };
@@ -4078,7 +4390,7 @@ export class LocalBackend {
       queryParams.file = params.file;
     }
 
-    const routes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
+    const routes = await this.fetchRoutesWithConsumers(repo.lbugPath, routeFilter, queryParams);
 
     if (routes.length === 0) {
       const target = params.route || params.file;
@@ -4086,7 +4398,7 @@ export class LocalBackend {
     }
 
     const flowMap = await this.fetchLinkedFlowsBatch(
-      repo.id,
+      repo.lbugPath,
       routes.map((r) => r.id),
     );
 
@@ -4212,12 +4524,12 @@ export class LocalBackend {
    */
   async queryClusters(repoName?: string, limit = 100): Promise<{ clusters: any[] }> {
     const repo = await this.resolveRepo(repoName);
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     try {
       const rawLimit = Math.max(limit * 5, 200);
       const clusters = await executeQuery(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (c:Community)
         RETURN c.id AS id, c.label AS label, c.heuristicLabel AS heuristicLabel, c.cohesion AS cohesion, c.symbolCount AS symbolCount
@@ -4244,11 +4556,11 @@ export class LocalBackend {
    */
   async queryProcesses(repoName?: string, limit = 50): Promise<{ processes: any[] }> {
     const repo = await this.resolveRepo(repoName);
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     try {
       const processes = await executeQuery(
-        repo.id,
+        repo.lbugPath,
         `
         MATCH (p:Process)
         RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
@@ -4276,10 +4588,10 @@ export class LocalBackend {
    */
   async queryClusterDetail(name: string, repoName?: string): Promise<any> {
     const repo = await this.resolveRepo(repoName);
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const clusters = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `
       MATCH (c:Community)
       WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
@@ -4306,7 +4618,7 @@ export class LocalBackend {
     }
 
     const members = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `
       MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
       WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
@@ -4339,10 +4651,10 @@ export class LocalBackend {
    */
   async queryProcessDetail(name: string, repoName?: string): Promise<any> {
     const repo = await this.resolveRepo(repoName);
-    await this.ensureInitialized(repo.id);
+    await this.ensureInitialized(repo);
 
     const processes = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `
       MATCH (p:Process)
       WHERE p.label = $processName OR p.heuristicLabel = $processName
@@ -4356,7 +4668,7 @@ export class LocalBackend {
     const proc = processes[0];
     const procId = proc.id || proc[0];
     const steps = await executeParameterized(
-      repo.id,
+      repo.lbugPath,
       `
       MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: $procId})
       RETURN n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, r.step AS step

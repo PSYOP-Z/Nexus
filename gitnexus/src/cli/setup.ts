@@ -15,6 +15,13 @@ import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 import { parseTree, modify, applyEdits, ParseError, parse as parseJsonc } from 'jsonc-parser';
 import { getGlobalDir } from '../storage/repo-manager.js';
+import {
+  getEditorTargets,
+  mcpTarget,
+  skillTarget,
+  hookTarget,
+  detectIndentation,
+} from './editor-targets.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -33,7 +40,44 @@ if (typeof _pkg.version !== 'string' || !_pkg.version) {
     'gitnexus/package.json#version is missing or not a string — cannot generate MCP fallback config.',
   );
 }
-const NPX_REF = `gitnexus@${_pkg.version}`;
+// Version-pinned ref for the persisted MCP entry — deliberately distinct from
+// the cjs's exported `gitnexus@latest` hint ref (resolve-analyze-cmd.cjs); the
+// two are not unified (see the comment above and that file's MCP_PINNED_REF).
+const MCP_PINNED_REF = `gitnexus@${_pkg.version}`;
+
+/**
+ * Build the `command` string written into an editor's hook settings, which the
+ * editor shell-evaluates. `hookPath` is already forward-slash-normalized.
+ *
+ * On POSIX, single-quote the path: a single-quoted shell string expands nothing,
+ * so spaces and metacharacters ($, backtick, ;, |, &, newline, parens) in the
+ * install path cannot run as commands. The only character needing escaping
+ * inside single quotes is the single quote, via the standard `'\''` idiom
+ * (close, literal-quote, reopen). The previous double-quoted `node "..."` form
+ * left $/backtick live — a code-execution risk for an adversarial $HOME.
+ *
+ * On Windows, filenames cannot contain these POSIX metacharacters and the path
+ * is forward-slashed, so keep the double-quoted form with backslash-then-quote
+ * escaping (CodeQL js/incomplete-sanitization safe ordering).
+ */
+export function formatHookCommand(
+  hookPath: string,
+  isWindows = process.platform === 'win32',
+): string {
+  if (isWindows) {
+    const escaped = hookPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    return `node "${escaped}"`;
+  }
+  return `node '${hookPath.replace(/'/g, "'\\''")}'`;
+}
+
+// The exact source line each hook adapter ships, rewritten at install time to
+// point cliPath at the installed CLI. Kept as a named constant so the install
+// patch and its drift guard reference one string — if the adapter source ever
+// changes this literal, the guard records an actionable error instead of
+// silently shipping a hook with an unresolved relative cliPath.
+const CLI_PATH_SOURCE_LITERAL =
+  "let cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');";
 
 interface SetupResult {
   configured: string[];
@@ -99,12 +143,12 @@ function getMcpEntry() {
   if (process.platform === 'win32') {
     return {
       command: 'cmd',
-      args: ['/c', 'npx', '-y', NPX_REF, 'mcp'],
+      args: ['/c', 'npx', '-y', MCP_PINNED_REF, 'mcp'],
     };
   }
   return {
     command: 'npx',
-    args: ['-y', NPX_REF, 'mcp'],
+    args: ['-y', MCP_PINNED_REF, 'mcp'],
   };
 }
 
@@ -120,20 +164,9 @@ function getOpenCodeMcpEntry() {
   }
 
   if (process.platform === 'win32') {
-    return { type: 'local', command: ['cmd', '/c', 'npx', '-y', NPX_REF, 'mcp'] };
+    return { type: 'local', command: ['cmd', '/c', 'npx', '-y', MCP_PINNED_REF, 'mcp'] };
   }
-  return { type: 'local', command: ['npx', '-y', NPX_REF, 'mcp'] };
-}
-
-/**
- * Detect indentation style from file content.
- * Returns formatting options matching the file's existing style.
- */
-function detectIndentation(raw: string): { tabSize: number; insertSpaces: boolean } {
-  const firstIndented = raw.match(/^( +|\t)/m);
-  if (!firstIndented) return { tabSize: 2, insertSpaces: true };
-  if (firstIndented[1] === '\t') return { tabSize: 1, insertSpaces: false };
-  return { tabSize: firstIndented[1].length, insertSpaces: true };
+  return { type: 'local', command: ['npx', '-y', MCP_PINNED_REF, 'mcp'] };
 }
 
 /**
@@ -196,9 +229,9 @@ async function setupCursor(result: SetupResult): Promise<void> {
     return;
   }
 
-  const mcpPath = path.join(cursorDir, 'mcp.json');
+  const { file: mcpPath, keyPath } = mcpTarget('cursor');
   try {
-    const ok = await mergeJsoncFile(mcpPath, ['mcpServers', 'gitnexus'], getMcpEntry());
+    const ok = await mergeJsoncFile(mcpPath, keyPath, getMcpEntry());
     if (ok) {
       result.configured.push('Cursor');
     } else {
@@ -217,9 +250,9 @@ async function setupClaudeCode(result: SetupResult): Promise<void> {
   }
 
   // Claude Code stores MCP config in ~/.claude.json
-  const mcpPath = path.join(os.homedir(), '.claude.json');
+  const { file: mcpPath, keyPath } = mcpTarget('claude');
   try {
-    const ok = await mergeJsoncFile(mcpPath, ['mcpServers', 'gitnexus'], getMcpEntry());
+    const ok = await mergeJsoncFile(mcpPath, keyPath, getMcpEntry());
     if (ok) {
       result.configured.push('Claude Code');
     } else {
@@ -239,7 +272,7 @@ async function installClaudeCodeSkills(result: SetupResult): Promise<void> {
   const claudeDir = path.join(os.homedir(), '.claude');
   if (!(await dirExists(claudeDir))) return;
 
-  const skillsDir = path.join(claudeDir, 'skills');
+  const skillsDir = skillTarget('claude').dir;
   try {
     const installed = await installSkillsTo(skillsDir);
     if (installed.length > 0) {
@@ -334,6 +367,48 @@ async function mergeHooksJsonc(
   return true;
 }
 
+const HOOK_HELPERS = [
+  'hook-lock.cjs',
+  'hook-db-lock-probe.cjs',
+  'win-rm-list-json.ps1',
+  'resolve-analyze-cmd.cjs',
+] as const;
+
+// win-rm-list-json.ps1 is best-effort: it is read (not require()'d) by
+// hook-db-lock-probe.cjs only on Windows, and that probe fails open when the
+// script is absent. Every other helper is top-level require()'d by the adapters,
+// so its absence crashes the installed hook — those are the ones a failed copy
+// must gate hook registration on (see copyHookHelpers' return value).
+const BEST_EFFORT_HOOK_HELPERS = new Set<string>(['win-rm-list-json.ps1']);
+
+/**
+ * Copy the shared hook helpers from `srcDir` into `destDir`. The adapters
+ * top-level `require()` the `.cjs` helpers, so a missing required helper makes
+ * the installed hook crash with MODULE_NOT_FOUND. A failed copy is recorded as a
+ * setup error, and the names of any failed REQUIRED helpers are returned so the
+ * caller can fail closed (skip hook registration) instead of registering a hook
+ * that crashes at runtime. `win-rm-list-json.ps1` is best-effort — its absence is
+ * recorded but does not gate registration. Both the Claude and Antigravity
+ * install paths copy this same list from hooks/claude/ (the canonical source).
+ */
+export async function copyHookHelpers(
+  srcDir: string,
+  destDir: string,
+  label: string,
+  result: SetupResult,
+): Promise<string[]> {
+  const failedRequired: string[] = [];
+  for (const helper of HOOK_HELPERS) {
+    try {
+      await fs.copyFile(path.join(srcDir, helper), path.join(destDir, helper));
+    } catch {
+      result.errors.push(`${label}: failed to copy ${helper} — hook may crash at runtime`);
+      if (!BEST_EFFORT_HOOK_HELPERS.has(helper)) failedRequired.push(helper);
+    }
+  }
+  return failedRequired;
+}
+
 /**
  * Install GitNexus hooks to ~/.claude/settings.json for Claude Code.
  * Merges hook config without overwriting existing hooks, preserving
@@ -343,13 +418,14 @@ async function installClaudeCodeHooks(result: SetupResult): Promise<void> {
   const claudeDir = path.join(os.homedir(), '.claude');
   if (!(await dirExists(claudeDir))) return;
 
-  const settingsPath = path.join(claudeDir, 'settings.json');
+  const claudeHook = hookTarget('claude');
+  const settingsPath = claudeHook.settingsFile;
 
   // Source hooks bundled within the gitnexus package (hooks/claude/)
   const pluginHooksPath = path.join(__dirname, '..', '..', 'hooks', 'claude');
 
   // Copy unified hook script to ~/.claude/hooks/gitnexus/
-  const destHooksDir = path.join(claudeDir, 'hooks', 'gitnexus');
+  const destHooksDir = claudeHook.scriptDir;
 
   try {
     await fs.mkdir(destHooksDir, { recursive: true });
@@ -361,49 +437,44 @@ async function installClaudeCodeHooks(result: SetupResult): Promise<void> {
       const resolvedCli = path.join(__dirname, '..', 'cli', 'index.js');
       const normalizedCli = path.resolve(resolvedCli).replace(/\\/g, '/');
       const jsonCli = JSON.stringify(normalizedCli);
-      content = content.replace(
-        "let cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');",
-        `let cliPath = ${jsonCli};`,
-      );
+      if (!content.includes(CLI_PATH_SOURCE_LITERAL)) {
+        result.errors.push(
+          'Claude Code hooks: gitnexus-hook.cjs no longer contains the cliPath literal to patch — the installed hook may fail to resolve the CLI. Update CLI_PATH_SOURCE_LITERAL in setup.ts.',
+        );
+      }
+      content = content.replace(CLI_PATH_SOURCE_LITERAL, `let cliPath = ${jsonCli};`);
       await fs.writeFile(dest, content, 'utf-8');
     } catch {
       // Script not found in source — skip
     }
 
+    // Fail closed: registering the hook without its adapter would crash on every
+    // tool invocation. Mirrors the Antigravity adapter guard below (this path
+    // previously registered regardless of whether the adapter wrote).
     try {
-      await fs.copyFile(
-        path.join(pluginHooksPath, 'hook-lock.cjs'),
-        path.join(destHooksDir, 'hook-lock.cjs'),
-      );
+      await fs.access(dest);
     } catch {
-      // Helper not found in source — skip
+      result.errors.push(
+        'Claude Code hooks: adapter script was not installed — skipping hook registration',
+      );
+      return;
     }
 
-    try {
-      await fs.copyFile(
-        path.join(pluginHooksPath, 'hook-db-lock-probe.cjs'),
-        path.join(destHooksDir, 'hook-db-lock-probe.cjs'),
+    const failedRequired = await copyHookHelpers(
+      pluginHooksPath,
+      destHooksDir,
+      'Claude Code hooks',
+      result,
+    );
+    if (failedRequired.length > 0) {
+      result.errors.push(
+        `Claude Code hooks: required helper(s) ${failedRequired.join(', ')} failed to copy — skipping hook registration`,
       );
-    } catch {
-      // Helper not found in source — skip
-    }
-
-    try {
-      await fs.copyFile(
-        path.join(pluginHooksPath, 'win-rm-list-json.ps1'),
-        path.join(destHooksDir, 'win-rm-list-json.ps1'),
-      );
-    } catch {
-      // Helper not found in source — skip
+      return;
     }
 
     const hookPath = path.join(destHooksDir, 'gitnexus-hook.cjs').replace(/\\/g, '/');
-    // Escape backslashes FIRST, then quotes (CodeQL js/incomplete-sanitization).
-    // The previous shape `replace(/"/g, '\\"')` alone would let `path\with"quote`
-    // become `path\with\"quote`, where the trailing `\` before `"` could
-    // unescape the quote inside the surrounding double-quoted shell context.
-    const escapedHookPath = hookPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    const hookCmd = `node "${escapedHookPath}"`;
+    const hookCmd = formatHookCommand(hookPath);
 
     // Check which hook events need entries (idempotent: skip if already registered)
     const parsed = await (async () => {
@@ -420,7 +491,7 @@ async function installClaudeCodeHooks(result: SetupResult): Promise<void> {
     // NOTE: SessionStart hooks are broken on Windows (Claude Code bug #23576).
     // Session context is delivered via CLAUDE.md / skills instead.
 
-    if (!hasGitnexusHook(parsed?.hooks, 'PreToolUse')) {
+    if (!hasGitnexusHook(parsed?.hooks, 'PreToolUse', claudeHook.needle)) {
       hookEntries.push({
         eventName: 'PreToolUse',
         value: {
@@ -436,7 +507,7 @@ async function installClaudeCodeHooks(result: SetupResult): Promise<void> {
         },
       });
     }
-    if (!hasGitnexusHook(parsed?.hooks, 'PostToolUse')) {
+    if (!hasGitnexusHook(parsed?.hooks, 'PostToolUse', claudeHook.needle)) {
       hookEntries.push({
         eventName: 'PostToolUse',
         value: {
@@ -492,9 +563,9 @@ async function setupAntigravity(result: SetupResult): Promise<void> {
     return;
   }
 
-  const mcpPath = path.join(antigravityDir, 'mcp_config.json');
+  const { file: mcpPath, keyPath } = mcpTarget('antigravity');
   try {
-    const ok = await mergeJsoncFile(mcpPath, ['mcpServers', 'gitnexus'], getMcpEntry());
+    const ok = await mergeJsoncFile(mcpPath, keyPath, getMcpEntry());
     if (ok) {
       result.configured.push('Antigravity');
     } else {
@@ -516,7 +587,7 @@ async function installAntigravitySkills(result: SetupResult): Promise<void> {
   const antigravityDir = path.join(os.homedir(), '.gemini', 'antigravity');
   if (!(await dirExists(antigravityDir))) return;
 
-  const skillsDir = path.join(antigravityDir, 'skills');
+  const skillsDir = skillTarget('antigravity').dir;
   try {
     const installed = await installSkillsTo(skillsDir);
     if (installed.length > 0) {
@@ -544,9 +615,9 @@ async function installAntigravityHooks(result: SetupResult): Promise<void> {
   const antigravityDir = path.join(os.homedir(), '.gemini', 'antigravity');
   if (!(await dirExists(antigravityDir))) return;
 
-  const geminiDir = path.join(os.homedir(), '.gemini');
-  const settingsPath = path.join(geminiDir, 'settings.json');
-  const destHooksDir = path.join(geminiDir, 'config', 'hooks', 'gitnexus');
+  const antigravityHook = hookTarget('antigravity');
+  const settingsPath = antigravityHook.settingsFile;
+  const destHooksDir = antigravityHook.scriptDir;
 
   // The antigravity adapter shares its lock/probe helpers with the claude
   // adapter — same DB, same concurrency rules — so we reuse those CJS files
@@ -566,10 +637,12 @@ async function installAntigravityHooks(result: SetupResult): Promise<void> {
       const resolvedCli = path.join(__dirname, '..', 'cli', 'index.js');
       const normalizedCli = path.resolve(resolvedCli).replace(/\\/g, '/');
       const jsonCli = JSON.stringify(normalizedCli);
-      content = content.replace(
-        "let cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');",
-        `let cliPath = ${jsonCli};`,
-      );
+      if (!content.includes(CLI_PATH_SOURCE_LITERAL)) {
+        result.errors.push(
+          'Antigravity hooks: gitnexus-antigravity-hook.cjs no longer contains the cliPath literal to patch — the installed hook may fail to resolve the CLI. Update CLI_PATH_SOURCE_LITERAL in setup.ts.',
+        );
+      }
+      content = content.replace(CLI_PATH_SOURCE_LITERAL, `let cliPath = ${jsonCli};`);
       await fs.writeFile(adapterDest, content, 'utf-8');
     } catch {
       // Adapter not found in source — skip
@@ -591,19 +664,21 @@ async function installAntigravityHooks(result: SetupResult): Promise<void> {
     // required by hook-db-lock-probe.cjs on Windows — without it, the MCP
     // server ownership probe silently fails open and the hook may contend
     // with the MCP server on the LadybugDB.
-    for (const helper of ['hook-lock.cjs', 'hook-db-lock-probe.cjs', 'win-rm-list-json.ps1']) {
-      try {
-        await fs.copyFile(path.join(pluginClaudeDir, helper), path.join(destHooksDir, helper));
-      } catch {
-        result.errors.push(
-          `Antigravity hooks: failed to copy ${helper} — hook may crash at runtime`,
-        );
-      }
+    const failedRequired = await copyHookHelpers(
+      pluginClaudeDir,
+      destHooksDir,
+      'Antigravity hooks',
+      result,
+    );
+    if (failedRequired.length > 0) {
+      result.errors.push(
+        `Antigravity hooks: required helper(s) ${failedRequired.join(', ')} failed to copy — skipping hook registration`,
+      );
+      return;
     }
 
     const hookPath = path.join(destHooksDir, 'gitnexus-antigravity-hook.cjs').replace(/\\/g, '/');
-    const escapedHookPath = hookPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    const hookCmd = `node "${escapedHookPath}"`;
+    const hookCmd = formatHookCommand(hookPath);
 
     const parsed = await (async () => {
       try {
@@ -616,7 +691,7 @@ async function installAntigravityHooks(result: SetupResult): Promise<void> {
 
     const hookEntries: Array<{ eventName: string; value: unknown }> = [];
 
-    if (!hasGitnexusHook(parsed?.hooks, 'AfterTool', 'gitnexus-antigravity-hook')) {
+    if (!hasGitnexusHook(parsed?.hooks, 'AfterTool', antigravityHook.needle)) {
       // Matcher follows the Gemini CLI built-in tool naming (snake_case).
       // search_file_content / glob cover content + filename search; run_shell_command
       // catches rg/grep invocations and the git commit family for stale-index hints.
@@ -664,9 +739,9 @@ async function setupOpenCode(result: SetupResult): Promise<void> {
     return;
   }
 
-  const configPath = path.join(opencodeDir, 'opencode.json');
+  const { file: configPath, keyPath } = mcpTarget('opencode');
   try {
-    const ok = await mergeJsoncFile(configPath, ['mcp', 'gitnexus'], getOpenCodeMcpEntry());
+    const ok = await mergeJsoncFile(configPath, keyPath, getOpenCodeMcpEntry());
     if (ok) {
       result.configured.push('OpenCode');
     } else {
@@ -686,7 +761,7 @@ function getCodexMcpTomlSection(): string {
   const entry = getMcpEntry();
   const command = JSON.stringify(entry.command);
   const args = `[${entry.args.map((arg) => JSON.stringify(arg)).join(', ')}]`;
-  return `[mcp_servers.gitnexus]\ncommand = ${command}\nargs = ${args}\n`;
+  return `[${getEditorTargets().codex.tomlSection}]\ncommand = ${command}\nargs = ${args}\n`;
 }
 
 /**
@@ -700,7 +775,7 @@ async function upsertCodexConfigToml(configPath: string): Promise<void> {
     existing = '';
   }
 
-  if (existing.includes('[mcp_servers.gitnexus]')) {
+  if (existing.includes(`[${getEditorTargets().codex.tomlSection}]`)) {
     return;
   }
 
@@ -731,7 +806,7 @@ async function setupCodex(result: SetupResult): Promise<void> {
   }
 
   try {
-    const configPath = path.join(codexDir, 'config.toml');
+    const configPath = getEditorTargets().codex.configFile;
     await upsertCodexConfigToml(configPath);
     result.configured.push('Codex (MCP added to ~/.codex/config.toml)');
   } catch (err: any) {
@@ -842,7 +917,7 @@ async function installCursorSkills(result: SetupResult): Promise<void> {
   const cursorDir = path.join(os.homedir(), '.cursor');
   if (!(await dirExists(cursorDir))) return;
 
-  const skillsDir = path.join(cursorDir, 'skills');
+  const skillsDir = skillTarget('cursor').dir;
   try {
     const installed = await installSkillsTo(skillsDir);
     if (installed.length > 0) {
@@ -860,7 +935,7 @@ async function installOpenCodeSkills(result: SetupResult): Promise<void> {
   const opencodeDir = path.join(os.homedir(), '.config', 'opencode');
   if (!(await dirExists(opencodeDir))) return;
 
-  const skillsDir = path.join(opencodeDir, 'skills');
+  const skillsDir = skillTarget('opencode').dir;
   try {
     const installed = await installSkillsTo(skillsDir);
     if (installed.length > 0) {
@@ -880,7 +955,7 @@ async function installCodexSkills(result: SetupResult): Promise<void> {
   const codexDir = path.join(os.homedir(), '.codex');
   if (!(await dirExists(codexDir))) return;
 
-  const skillsDir = path.join(os.homedir(), '.agents', 'skills');
+  const skillsDir = skillTarget('codex').dir;
   try {
     const installed = await installSkillsTo(skillsDir);
     if (installed.length > 0) {

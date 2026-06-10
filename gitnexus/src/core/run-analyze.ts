@@ -13,6 +13,7 @@ import path from 'path';
 import fs from 'fs/promises';
 import { execFileSync } from 'child_process';
 import { runPipelineFromRepo } from './ingestion/pipeline.js';
+import { resetDegradedParseCounter } from './tree-sitter/safe-parse.js';
 import {
   initLbug,
   loadGraphToLbug,
@@ -47,7 +48,16 @@ import {
   computeEffectiveWriteSet,
 } from './incremental/subgraph-extract.js';
 import { shadowCandidatesFor } from './incremental/shadow-candidates.js';
-import { loadParseCache, saveParseCache, pruneCache } from '../storage/parse-cache.js';
+import {
+  loadParseCache,
+  saveParseCache,
+  pruneCache,
+  PARSE_CACHE_VERSION,
+} from '../storage/parse-cache.js';
+import {
+  getDurableParsedFileDir,
+  pruneAndSaveDurableParsedFileStore,
+} from '../storage/parsedfile-store.js';
 import {
   getCurrentCommit,
   getRemoteUrl,
@@ -106,6 +116,13 @@ export interface AnalyzeOptions {
   /** Skip installing standard GitNexus skill files to .claude/skills/gitnexus/. */
   skipSkills?: boolean;
   /**
+   * Default branch threaded into generated AGENTS.md / CLAUDE.md so the
+   * regression-compare example uses the configured branch instead of a
+   * hardcoded "main" (#243). Resolved by the CLI; `undefined` here keeps the
+   * "main" fallback for non-CLI callers (e.g. the server analyze worker).
+   */
+  defaultBranch?: string;
+  /**
    * User-provided alias for the registry `name` (#829). When set,
    * forwarded to `registerRepo` so the indexed repo is stored under
    * this alias instead of the path-derived basename.
@@ -124,8 +141,8 @@ export interface AnalyzeOptions {
    * Worker pool size override, threaded from the CLI `--workers` flag.
    * Forwarded to `PipelineOptions.workerPoolSize` so the parse phase
    * sizes the pool without `analyzeCommand` mutating `process.env`.
-   * `0` disables the pool (sequential fallback); positive integer sets
-   * the count; `undefined` defers to the env / auto-formula fallback.
+   * Must be a positive integer — `0` hard-errors (sequential parsing was
+   * removed); `undefined` defers to the env / auto-formula fallback.
    */
   workerPoolSize?: number;
 }
@@ -222,6 +239,14 @@ export async function runFullAnalysis(
   const log = (msg: string) => callbacks.onLog?.(msg);
   const progress = (phase: string, percent: number, message: string) =>
     callbacks.onProgress(phase, percent, message);
+
+  // Scope the degraded-parse log throttle to this run. On a reused process
+  // (e.g. tests, or any host that calls runFullAnalysis more than once) the
+  // module-level counter would otherwise stay saturated and suppress every
+  // degraded-parse log after the first run. The per-parse worker holds its own
+  // counter in its own module instance and is process-scoped, so no separate
+  // worker-side reset is needed (see safe-parse.ts ParseTimeoutError contract).
+  resetDegradedParseCounter();
 
   const { storagePath, lbugPath } = getStoragePaths(repoPath);
 
@@ -974,7 +999,19 @@ export async function runFullAnalysis(
       if (pruned > 0) {
         log(`Parse cache: pruned ${pruned} stale chunk entries`);
       }
-      await saveParseCache(storagePath, parseCache);
+      const savedKeys = await saveParseCache(storagePath, parseCache);
+      // Prune the durable ParsedFile store to EXACTLY the parse cache's
+      // surviving keys (#2038 warm-cache coverage), so the two content-addressed
+      // stores stay coherent: a chunk is "cached" iff both its parse-cache shard
+      // and its durable shards exist. A quarantined chunk (in usedKeys but with
+      // no parse-cache shard) drops its durable subdir here and re-dispatches
+      // next run. Same try/catch — a durable-store write failure must never
+      // break an otherwise successful run (next run treats it as a miss).
+      await pruneAndSaveDurableParsedFileStore(
+        getDurableParsedFileDir(storagePath),
+        PARSE_CACHE_VERSION,
+        new Set(savedKeys),
+      );
     } catch (e) {
       log(`Warning: could not save parse cache (${(e as Error).message}); continuing.`);
     }
@@ -1025,6 +1062,7 @@ export async function runFullAnalysis(
           skipAgentsMd: options.skipAgentsMd,
           skipSkills: options.skipSkills,
           noStats: options.noStats,
+          defaultBranch: options.defaultBranch,
         },
       );
     } catch {

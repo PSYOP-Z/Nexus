@@ -25,6 +25,7 @@
 
 import type { ParsedFile, RegistryProviders } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../../../graph/types.js';
+import { generateId } from '../../../../lib/utils.js';
 import { lookupOwnedMembersByOwner } from '../../model/owned-members-lookup.js';
 import type { MutableSemanticModel, SemanticModel } from '../../model/semantic-model.js';
 import { reconcileOwnership, validateOwnershipParity } from './reconcile-ownership.js';
@@ -35,18 +36,58 @@ import { resolveReferenceSites, type ResolveStats } from '../../resolve-referenc
 import { buildGraphNodeLookup } from '../graph-bridge/node-lookup.js';
 import { resolveDefGraphId } from '../graph-bridge/ids.js';
 import { buildPopulatedMethodDispatch } from '../graph-bridge/method-dispatch.js';
-import { tryEmitEdge } from '../graph-bridge/edges.js';
 import { propagateImportedReturnTypes } from '../passes/imported-return-types.js';
 import { emitReceiverBoundCalls } from '../passes/receiver-bound-calls.js';
 import { emitFreeCallFallback } from '../passes/free-call-fallback.js';
 import { emitReferencesViaLookup } from '../graph-bridge/references-to-edges.js';
 import { emitImportEdges } from '../graph-bridge/imports-to-edges.js';
 import type { ScopeResolver } from '../contract/scope-resolver.js';
-import { findClassBindingInScope, findEnclosingClassDef } from '../scope/walkers.js';
+import { findEnclosingClassDef, resolveInheritanceBaseInScope } from '../scope/walkers.js';
 import { buildWorkspaceResolutionIndex } from '../workspace-index.js';
 import type { ResolutionOutcome, ResolutionOutcomeRecorder } from '../resolution-outcome.js';
+import { logHeapProbe } from '../../utils/heap-probe.js';
+import { parseTruthyEnv } from '../../utils/env.js';
+import { TransitionalScopeTree } from '../../../../storage/scope-index-store.js';
+import { forceGc } from '../../../../storage/parsedfile-store.js';
 
 import { logger } from '../../../logger.js';
+
+/**
+ * Emit one class-owned inheritance edge directly (the inheritance pre-pass is
+ * the authoritative emitter — see `preEmitInheritanceEdges`). Encapsulates the
+ * dual dedup contract so the two sets' joint semantics live in one place:
+ *   - `existing` — coarse per-`(caller, target, type)` gate, seeded from the
+ *     graph (so this pass is a no-op when the legacy path already emitted it).
+ *   - `seen` — per-site key shared with the generic edge bridge so the two
+ *     passes never double-emit the same resolution.
+ * The `dedupKey` and `rel:` id shape match `tryEmitEdge` exactly, so graph
+ * output stays byte-identical. The caller is the enclosing class (NOT the
+ * method/constructor `resolveCallerGraphId` would prefer — that broke MRO for
+ * C# 12 primary constructors, #1951); the edge type is pre-discriminated.
+ */
+function emitInheritanceEdgeDirect(
+  graph: KnowledgeGraph,
+  seen: Set<string>,
+  existing: Set<string>,
+  callerGraphId: string,
+  targetGraphId: string,
+  edgeType: 'EXTENDS' | 'IMPLEMENTS',
+  site: { readonly atRange: { startLine: number; startCol: number } },
+): void {
+  const edgeKey = `${edgeType}:${callerGraphId}->${targetGraphId}`;
+  const dedupKey = `${edgeKey}:${site.atRange.startLine}:${site.atRange.startCol}`;
+  if (existing.has(edgeKey) || seen.has(dedupKey)) return;
+  seen.add(dedupKey);
+  existing.add(edgeKey);
+  graph.addRelationship({
+    id: `rel:${dedupKey}`,
+    sourceId: callerGraphId,
+    targetId: targetGraphId,
+    type: edgeType,
+    confidence: 0.85,
+    reason: 'scope-resolution: inherits',
+  });
+}
 
 /**
  * Resolve inheritance reference sites early and pre-emit their EXTENDS edges
@@ -63,10 +104,12 @@ function preEmitInheritanceEdges(
 ): Set<string> {
   const handledSites = new Set<string>();
   const seen = new Set<string>();
+  // Tracks inheritance edges emitted during this pass so the structural
+  // interface-implementation pass (emitDetectedInterfaceImplementations) and
+  // repeated `inherits` sites don't double-emit. Starts empty: this pre-pass is
+  // the authoritative inheritance emitter — no EXTENDS/IMPLEMENTS edges exist in
+  // the graph before it runs (the legacy heritage path was removed in #942).
   const existing = new Set<string>();
-  for (const rel of graph.iterRelationshipsByType('EXTENDS')) {
-    existing.add(`${rel.sourceId}->${rel.targetId}`);
-  }
 
   for (const site of scopes.referenceSites) {
     if (site.kind !== 'inherits') continue;
@@ -81,39 +124,103 @@ function preEmitInheritanceEdges(
       // edge. The shared bridge resolves the source via
       // `resolveCallerGraphId`, which can degrade class-heritage sites into
       // method-owned EXTENDS edges once methods exist on the class. This
-      // pre-pass is the authoritative inheritance emitter, so broad
+      // pre-pass is the authoritative inheritance emitter and pins the source
+      // to the enclosing class (via the `callerGraphId` override below), so
       // suppression keeps `buildMro` and the final graph class-owned.
       handledSites.add(siteKey);
     }
 
-    const targetDef = findClassBindingInScope(site.inScope, site.name, scopes);
-    if (targetDef === undefined) continue;
-
+    // Resolve the deriving (caller) class first and reuse it as the enclosing
+    // context for qualified-base resolution — avoids a second findEnclosingClassDef
+    // walk per qualified site (#1982 perf). Both need the same enclosing class.
     const callerClass = findEnclosingClassDef(site.inScope, scopes);
     if (callerClass === undefined) continue;
+
+    const targetDef = resolveInheritanceBaseInScope(
+      site.inScope,
+      site.name,
+      scopes,
+      site.rawQualifiedName,
+      callerClass,
+    );
+    if (targetDef === undefined) continue;
     const callerGraphId = resolveDefGraphId(callerClass.filePath, callerClass, nodeLookup);
     const targetGraphId = resolveDefGraphId(targetDef.filePath, targetDef, nodeLookup);
     if (callerGraphId === undefined || targetGraphId === undefined) continue;
-    const edgeKey = `${callerGraphId}->${targetGraphId}`;
-    if (existing.has(edgeKey)) continue;
-
-    if (
-      tryEmitEdge(
-        graph,
-        scopes,
-        nodeLookup,
-        site,
-        targetDef,
-        'scope-resolution: inherits',
-        seen,
-        0.85,
-      )
-    ) {
-      existing.add(edgeKey);
-    }
+    // Discriminate EXTENDS vs IMPLEMENTS by the resolved target's symbol kind:
+    // conforming to an interface OR mixing in a trait/protocol is IMPLEMENTS,
+    // deriving from a class-like is EXTENDS. The discriminator is purely
+    // symbol-kind-driven (no language is named here, per AGENTS.md): a base that
+    // resolves to neither an Interface nor a Trait symbol always takes the
+    // EXTENDS branch, so such languages are unchanged.
+    const edgeType: 'EXTENDS' | 'IMPLEMENTS' =
+      targetDef.type === 'Interface' || targetDef.type === 'Trait' ? 'IMPLEMENTS' : 'EXTENDS';
+    emitInheritanceEdgeDirect(graph, seen, existing, callerGraphId, targetGraphId, edgeType, site);
   }
 
   return handledSites;
+}
+
+/**
+ * Emit language-inferred structural interface implementations before MRO and
+ * interface dispatch are built. Languages such as Go do not declare
+ * `implements` explicitly, so their resolver can infer defId-level interface
+ * satisfaction from parsed files and this bridge converts those defIds to
+ * graph node ids.
+ *
+ * Existing explicit IMPLEMENTS edges win: the local `existing` set prevents
+ * duplicate structural edges and keeps this hook language-neutral. The reason
+ * string carries the provider language (`go-structural-implements`) so callers
+ * can distinguish inferred edges from source-declared heritage.
+ */
+function emitDetectedInterfaceImplementations(
+  graph: KnowledgeGraph,
+  parsedFiles: readonly ParsedFile[],
+  nodeLookup: ReturnType<typeof buildGraphNodeLookup>,
+  provider: ScopeResolver,
+  indexes: ReturnType<typeof finalizeScopeModel>,
+  model: SemanticModel,
+): number {
+  if (provider.detectInterfaceImplementations === undefined) return 0;
+
+  const graphIdByDefId = new Map<string, string>();
+  for (const parsed of parsedFiles) {
+    for (const def of parsed.localDefs) {
+      if (def.type !== 'Class' && def.type !== 'Struct' && def.type !== 'Interface') continue;
+      const graphId = resolveDefGraphId(parsed.filePath, def, nodeLookup);
+      if (graphId !== undefined) graphIdByDefId.set(def.nodeId, graphId);
+    }
+  }
+
+  const existing = new Set<string>();
+  for (const rel of graph.iterRelationshipsByType('IMPLEMENTS')) {
+    existing.add(`${rel.sourceId}->${rel.targetId}`);
+  }
+
+  let emitted = 0;
+  const detected = provider.detectInterfaceImplementations(parsedFiles, indexes, model);
+  for (const [interfaceDefId, implementorDefIds] of detected) {
+    const targetId = graphIdByDefId.get(interfaceDefId);
+    if (targetId === undefined) continue;
+    for (const implementorDefId of implementorDefIds) {
+      const sourceId = graphIdByDefId.get(implementorDefId);
+      if (sourceId === undefined) continue;
+      const edgeKey = `${sourceId}->${targetId}`;
+      if (existing.has(edgeKey)) continue;
+      existing.add(edgeKey);
+      graph.addRelationship({
+        id: generateId('IMPLEMENTS', edgeKey),
+        sourceId,
+        targetId,
+        type: 'IMPLEMENTS',
+        confidence: 0.85,
+        reason: `${provider.language}-structural-implements`,
+      });
+      emitted++;
+    }
+  }
+
+  return emitted;
 }
 
 export type ScopeResolutionSubPhase =
@@ -137,13 +244,26 @@ interface RunScopeResolutionInput {
   readonly files: readonly { readonly path: string; readonly content: string }[];
   readonly onWarn?: (message: string) => void;
   /**
-   * Optional pre-parsed-Tree lookup keyed by file path. When the
-   * pipeline's parse phase ran sequentially, it populated an
-   * `ASTCache`; passing that here lets the per-file extract step
-   * skip a second `tree-sitter parser.parse(...)` call. Cache miss
-   * is safe — falls back to a fresh parse inside the provider.
+   * Optional pre-parsed-Tree lookup keyed by file path: a cache hit lets the
+   * per-file extract step skip a second `tree-sitter parser.parse(...)` call.
+   * Currently always empty — the only producer was the (removed) sequential
+   * parser, and workers can't return native Trees across the MessageChannel,
+   * so the parse phase no longer threads one. Kept as an extension point;
+   * cache miss is safe (the provider re-parses).
    */
   readonly treeCache?: { get(filePath: string): unknown };
+  /**
+   * Optional graph-node lookup built ONCE by the caller and shared across
+   * every language pass. `buildGraphNodeLookup` scans the whole graph and is
+   * language-agnostic, so rebuilding it per language wastes both CPU and ~GBs
+   * of heap (on the kernel it is ~2 GB; a 5-file language would otherwise build
+   * its own full copy that then overlaps the next language's). When omitted
+   * (tests / isolated calls) the lookup is built locally as before. Providers
+   * that add graph nodes mid-pass (e.g. Ruby heritage Property nodes) still
+   * rebuild a fresh post-heritage lookup internally, so sharing the pre-loop
+   * base is safe.
+   */
+  readonly prebuiltNodeLookup?: ReturnType<typeof buildGraphNodeLookup>;
   /**
    * Opaque per-language import-resolution config (e.g. tsconfig path
    * aliases for TypeScript). Loaded once by the caller via
@@ -168,6 +288,15 @@ interface RunScopeResolutionInput {
    * Cache miss is safe — falls back to fresh extract.
    */
   readonly preExtractedParsedFiles?: ReadonlyMap<string, ParsedFile>;
+  /**
+   * Out-of-core scope index (disk-backed scope seal). When set AND `GITNEXUS_DISK_SCOPE_INDEX` is
+   * enabled, the per-language `scopeTree` is sealed to a disk-backed store at
+   * this path after resolve (before emit), and the heavy `Scope.bindings`
+   * payload is dropped from heap — lowering the per-language peak (kernel:
+   * ~20→~12 GB) so the analysis fits on smaller-RAM machines. Same storage path
+   * as the ParsedFile store; a sibling `scope-index-store/` dir.
+   */
+  readonly scopeIndexStorePath?: string;
   /**
    * Optional additive diagnostics sink. Resolver passes call this when they
    * intentionally suppress an edge; the graph remains unchanged.
@@ -225,15 +354,20 @@ export function runScopeResolution(
   let preExtractedHits = 0;
   const progressInterval = files.length > 0 ? Math.max(1, Math.floor(files.length / 50)) : 1;
   input.onProgress?.('extracting', 0, files.length);
+  logHeapProbe('sr-extract-start', `lang=${provider.language} files=${files.length}`);
   for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
     const file = files[fileIdx];
     let parsed: ParsedFile | undefined;
     // Fast path: a worker (during the parse phase) already produced a
     // ParsedFile for this file via `extractParsedFile`. Reuse it
     // directly — skips a tree-sitter re-parse on the main thread.
+    let reusedPreExtracted = false;
     if (preExtracted !== undefined) {
       parsed = preExtracted.get(file.path);
-      if (parsed !== undefined) preExtractedHits++;
+      if (parsed !== undefined) {
+        preExtractedHits++;
+        reusedPreExtracted = true;
+      }
     }
     if (parsed === undefined) {
       const cachedTree = treeCache?.get(file.path);
@@ -249,18 +383,37 @@ export function runScopeResolution(
         continue;
       }
     }
+    // Worker-boundary restore: a pre-extracted ParsedFile was produced by
+    // `extractParsedFile` running INSIDE a worker, so any capture-time
+    // module-level side-channel state (`emitScopeCaptures` side effects that
+    // are NOT serialized onto the ParsedFile's scopes/defs — C++ ADL/namespace
+    // marks) was populated in the worker process and is missing here. The
+    // worker stashed a plain-data snapshot on `parsed.captureSideChannel` (via
+    // `collectCaptureSideChannel`); write it back into the module maps now,
+    // BEFORE populateOwners consumes the resolved ranges. NO re-parse — that is
+    // the #1983 fix. The fresh-extract leg above already populated those marks
+    // in this process, so it skips the restore. See
+    // `ScopeResolver.applyCaptureSideChannel`.
+    if (reusedPreExtracted && provider.applyCaptureSideChannel !== undefined) {
+      provider.applyCaptureSideChannel(parsed);
+    }
     provider.populateOwners(parsed);
     parsedFiles.push(parsed);
-    if (
-      input.onProgress &&
-      ((fileIdx + 1) % progressInterval === 0 || fileIdx === files.length - 1)
-    ) {
-      input.onProgress('extracting', fileIdx + 1, files.length);
+    if ((fileIdx + 1) % progressInterval === 0 || fileIdx === files.length - 1) {
+      input.onProgress?.('extracting', fileIdx + 1, files.length);
+      logHeapProbe(
+        'sr-extract-progress',
+        `lang=${provider.language} idx=${fileIdx + 1}/${files.length} parsedFiles=${parsedFiles.length} preExtractedHits=${preExtractedHits}`,
+      );
     }
   }
   if (PROF && preExtracted !== undefined) {
     logger.warn(`[scope-resolution prof] pre-extracted hits: ${preExtractedHits}/${files.length}`);
   }
+  logHeapProbe(
+    'sr-extract-end',
+    `lang=${provider.language} parsedFiles=${parsedFiles.length} preExtractedHits=${preExtractedHits} skipped=${filesSkipped}`,
+  );
   provider.populateWorkspaceOwners?.(parsedFiles, { fileContents: getFileContents() });
 
   // Reconcile scope-resolution's ownership view into the SemanticModel.
@@ -294,7 +447,9 @@ export function runScopeResolution(
   // ── Phase 2: finalize → ScopeResolutionIndexes ─────────────────────────
   input.onProgress?.('analyzing types', files.length, files.length);
   const allFilePaths = new Set(parsedFiles.map((f) => f.filePath));
-  const nodeLookup = buildGraphNodeLookup(graph);
+  logHeapProbe('sr-pre-nodeLookup', `lang=${provider.language}`);
+  const nodeLookup = input.prebuiltNodeLookup ?? buildGraphNodeLookup(graph);
+  logHeapProbe('sr-post-nodeLookup', `lang=${provider.language}`);
 
   const resolutionConfig = input.resolutionConfig;
   const finalized = finalizeScopeModel(parsedFiles, {
@@ -307,13 +462,14 @@ export function runScopeResolution(
         provider.mergeBindings(existing, incoming, scopeId),
     },
   });
+  logHeapProbe('sr-post-finalize', `lang=${provider.language}`);
   const preEmittedInheritanceSites = preEmitInheritanceEdges(graph, finalized, nodeLookup);
   // Call-based heritage hook (e.g., Ruby include/extend/prepend) — emits
   // IMPLEMENTS edges that `preEmitInheritanceEdges` cannot produce because
   // the heritage declarations are syntactic method calls, not grammar-level
   // heritage clauses. Must run BEFORE `buildMro` so MRO construction sees
   // the freshly-emitted IMPLEMENTS edges.
-  provider.emitHeritageEdges?.(graph, parsedFiles, nodeLookup);
+  provider.emitHeritageEdges?.(graph, parsedFiles, nodeLookup, finalized);
   // Implicit IMPORTS-edge hook — for languages whose files have compiler-
   // implicit cross-file visibility (no syntactic import statement). The
   // finalized-ImportEdge pipeline (`emitImportEdges`) cannot produce these
@@ -327,6 +483,14 @@ export function runScopeResolution(
   // heritage hook are invisible and ACCESSES edges silently fail to emit.
   const postHeritageNodeLookup =
     provider.emitHeritageEdges !== undefined ? buildGraphNodeLookup(graph) : nodeLookup;
+  emitDetectedInterfaceImplementations(
+    graph,
+    parsedFiles,
+    postHeritageNodeLookup,
+    provider,
+    finalized,
+    readonlyModel,
+  );
   const mroByClassDefId = provider.buildMro(graph, parsedFiles, postHeritageNodeLookup);
   const extendsOnlyMroByClassDefId = provider.buildExtendsOnlyMro?.(
     graph,
@@ -350,7 +514,12 @@ export function runScopeResolution(
   // cannot carry. Must run AFTER `populateOwners` (so owned defs are
   // attributed correctly) and AFTER finalize (so module-scope
   // bindings are available).
-  const workspaceIndex = buildWorkspaceResolutionIndex(parsedFiles);
+  // Pass the scopeTree so the index's class/module Scope lookups are id-backed
+  // views that delegate to it (out-of-core scope index) — the index pins no Scope objects, so the
+  // disk seal can reclaim them. Byte-identical: the view returns the same Scope
+  // the resident tree holds (or a value-identical revived one in disk mode).
+  const workspaceIndex = buildWorkspaceResolutionIndex(parsedFiles, indexes.scopeTree);
+  logHeapProbe('sr-post-workspaceIndex', `lang=${provider.language}`);
 
   // Cross-file implicit-namespace visibility (C#). Must run before
   // propagateImportedReturnTypes so the latter pass sees siblings'
@@ -411,6 +580,33 @@ export function runScopeResolution(
       lookupOwnedMembersByOwner(readonlyModel, ownerDefId, memberName),
   });
   const tResolve = PROF ? process.hrtime.bigint() : 0n;
+  logHeapProbe('sr-post-resolve', `lang=${provider.language}`);
+
+  // ── Out-of-core scope seal boundary ─────────────────────────────────────
+  // Pass-A (finalize + propagate + resolve) is done; all whole-language reads
+  // of `Scope.bindings` are behind us. Emit reaches scopes ONLY via
+  // `scopeTree.getScope` (a point lookup), so seal the TransitionalScopeTree to
+  // disk now and drop the resident scopes. The scopes are pinned from THREE
+  // sides: (1) the model's frozen `scopeTree` — released by `seal()` nulling its
+  // resident backing from the inside; (2) `input.preExtractedParsedFiles` (held
+  // by the caller for its own post-run release) — released here since run.ts is
+  // its last reader after extract; (3) this function's `parsedFiles` — replaced
+  // by a scope-stripped copy that keeps only what emit reads (referenceSites /
+  // filePath / localDefs). All three released → the heavy payload is collectible.
+  let emitParsedFiles: readonly ParsedFile[] = parsedFiles;
+  if (
+    input.scopeIndexStorePath !== undefined &&
+    parseTruthyEnv(process.env.GITNEXUS_DISK_SCOPE_INDEX) &&
+    indexes.scopeTree instanceof TransitionalScopeTree
+  ) {
+    logHeapProbe('sr-seal-pre', `lang=${provider.language}`);
+    indexes.scopeTree.seal(input.scopeIndexStorePath);
+    emitParsedFiles = parsedFiles.map((p) => ({ ...p, scopes: [] }));
+    parsedFiles.length = 0;
+    if (preExtracted !== undefined) (preExtracted as Map<string, ParsedFile>).clear();
+    forceGc();
+    logHeapProbe('sr-seal-post', `lang=${provider.language}`);
+  }
 
   // ── Phase 4: emit graph edges (LOAD-BEARING ORDER — see I1) ────────────
   input.onProgress?.('linking symbols', files.length, files.length);
@@ -418,7 +614,7 @@ export function runScopeResolution(
   const receiverExtras = emitReceiverBoundCalls(
     graph,
     indexes,
-    parsedFiles,
+    emitParsedFiles,
     postHeritageNodeLookup,
     handledSites,
     provider,
@@ -433,7 +629,7 @@ export function runScopeResolution(
       ? provider.emitUnresolvedReceiverEdges(
           graph,
           indexes,
-          parsedFiles,
+          emitParsedFiles,
           postHeritageNodeLookup,
           handledSites,
           readonlyModel,
@@ -442,7 +638,7 @@ export function runScopeResolution(
   const freeCallExtras = emitFreeCallFallback(
     graph,
     indexes,
-    parsedFiles,
+    emitParsedFiles,
     postHeritageNodeLookup,
     referenceIndex,
     handledSites,
@@ -473,6 +669,16 @@ export function runScopeResolution(
     provider.importEdgeReason,
   );
 
+  // Language-specific supplementary edges (e.g. Vue template-derived
+  // BINDS_EVENT_HANDLER / EMITS_EVENT / CALLS / ACCESSES edges).
+  // Runs last so the full graph — including import edges — is visible.
+  if (provider.emitPostResolutionEdges !== undefined) {
+    provider.emitPostResolutionEdges(graph, emitParsedFiles, postHeritageNodeLookup, indexes, {
+      fileContents: getFileContents(),
+      resolutionConfig,
+    });
+  }
+
   if (PROF) {
     const tEnd = process.hrtime.bigint();
     const ns = (a: bigint, b: bigint): number => Number(b - a) / 1_000_000;
@@ -486,6 +692,8 @@ export function runScopeResolution(
         ` (${parsedFiles.length} files)`,
     );
   }
+
+  logHeapProbe('sr-end', `lang=${provider.language} parsedFiles=${parsedFiles.length}`);
 
   return {
     filesProcessed: parsedFiles.length,

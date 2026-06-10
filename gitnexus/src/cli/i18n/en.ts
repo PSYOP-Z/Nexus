@@ -106,6 +106,8 @@ export const en = {
   'help.option.version': 'output the version number',
   'help.command.setup.description':
     'One-time setup: configure MCP for Cursor, Claude Code, OpenCode, Codex',
+  'help.command.uninstall.description':
+    'Reverse `setup`: remove GitNexus MCP entries, skills, and hooks from all detected editors',
   'help.command.analyze.description': 'Index a repository (full analysis)',
   'help.command.index.description':
     'Register an existing .gitnexus/ folder into the global registry (no re-analysis needed)',
@@ -175,7 +177,7 @@ export const en = {
   'help.option.analyze.walCheckpointThreshold':
     'LadybugDB WAL auto-checkpoint threshold in bytes during analyze (integer >= -1; default: 67108864 = 64 MiB; -1 keeps Ladybug stock ~16 MiB).',
   'help.option.analyze.workers':
-    'Parse worker pool size. Default: cores-1 capped at 16. Pass 0 to disable workers (sequential).',
+    'Parse worker pool size (>=1). Default: cores-1 capped at 16, auto-sized to the repo.',
   'help.option.analyze.embeddingThreads': 'Limit local ONNX embedding CPU threads',
   'help.option.analyze.embeddingBatchSize': 'Number of nodes per embedding batch',
   'help.option.analyze.embeddingSubBatchSize': 'Number of chunks per embedding model call',
@@ -185,11 +187,12 @@ export const en = {
   'help.option.port': 'Port number',
   'help.option.serve.host': 'Bind address (default: 127.0.0.1, use 0.0.0.0 for remote access)',
   'help.option.force.confirmation': 'Skip confirmation prompt',
+  'help.option.uninstall.force': 'Apply the changes (default is a dry-run preview)',
   'help.option.clean.all': 'Clean all indexed repos',
   'help.option.clean.lbugSidecars': 'Clean quarantined LadybugDB missing-shadow WAL sidecars',
   'help.option.wiki.force': 'Force full regeneration even if up to date',
   'help.option.wiki.provider':
-    'LLM provider: openai, openrouter, azure, custom, cursor, claude, or codex (default: openai)',
+    'LLM provider: openai, openrouter, azure, custom, cursor, claude, codex, or opencode (default: openai)',
   'help.option.wiki.model': 'LLM model or Azure deployment name (default: minimax/minimax-m2.5)',
   'help.option.wiki.baseUrl':
     'LLM API base URL. Azure v1: https://{resource}.openai.azure.com/openai/v1',
