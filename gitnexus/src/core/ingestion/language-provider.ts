@@ -35,6 +35,7 @@ import type { MethodExtractor } from './method-types.js';
 import type { VariableExtractor } from './variable-types.js';
 import type { ImportResolverFn } from './import-resolvers/types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
+import type { CfgVisitor } from './cfg/types.js';
 import type { NodeLabel } from 'gitnexus-shared';
 import type Parser from 'tree-sitter';
 import type { ExtractedDecoratorRoute } from './workers/parse-worker.js';
@@ -187,6 +188,12 @@ interface LanguageProviderConfig {
    * `undefined` when no constraints exist / the node isn't a templated
    * function. Languages without SFINAE / concept semantics leave this
    * undefined and the disambiguation is a pass-through.
+   *
+   * Cloneability contract: the returned payload crosses the worker boundary
+   * via structured clone, so it MUST be structured-clone-safe (no functions,
+   * symbols, or tree-sitter `SyntaxNode`s — only plain data). Wrap the return
+   * with `assertCloneable` from `workers/clone-safety.ts` so a future leak is a
+   * compile error at the source instead of a runtime DataCloneError (#2143).
    */
   readonly extractTemplateConstraints?: (definitionNode: SyntaxNode) => unknown;
 
@@ -343,12 +350,27 @@ interface LanguageProviderConfig {
    * disk store WITHOUT a main-thread re-parse. The main thread restores them
    * via the matching `ScopeResolver.applyCaptureSideChannel` hook.
    *
-   * MUST return plain data (objects / arrays / primitives) so it round-trips
-   * through `JSON.stringify` + the parsedfile-store interning reviver.
+   * Cloneability contract: MUST return plain data (objects / arrays /
+   * primitives — no functions, symbols, or tree-sitter `SyntaxNode`s) so it
+   * survives BOTH the worker→main structured clone AND `JSON.stringify` + the
+   * parsedfile-store interning reviver. Wrap the return with `assertCloneable`
+   * from `workers/clone-safety.ts` so a future non-serializable leak is a
+   * compile error at the source instead of a runtime DataCloneError (#2143).
    *
    * Default: undefined (provider has no capture-time module-level side effects).
    */
   readonly collectCaptureSideChannel?: (filePath: string) => unknown;
+
+  /**
+   * Per-language control-flow-graph builder (#2081 M1, PDG/taint substrate).
+   * Invoked IN THE PARSE WORKER (where the AST lives) for each function node,
+   * gated on the `--pdg` opt-in; the resulting per-function CFGs are serialized
+   * onto `ParsedFile.cfgSideChannel` and emitted as BasicBlock nodes + CFG
+   * edges during scope-resolution. `TNode` is `SyntaxNode` for the tree-sitter
+   * languages. Default: undefined (language has no CFG support yet — TS/JS are
+   * the M1 set).
+   */
+  readonly cfgVisitor?: CfgVisitor<SyntaxNode>;
 
   /**
    * Interpret a raw `@import.statement` capture group into a `ParsedImport`.
