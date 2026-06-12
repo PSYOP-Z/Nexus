@@ -11,7 +11,7 @@ import type {
   CSharpNamespaceEvidence,
   ComposerConfig,
 } from '../language-config.js';
-import type { SwiftPackageConfig } from '../language-config.js';
+import type { SwiftPackageConfig, ZigBuildZonConfig } from '../language-config.js';
 import type { SuffixIndex } from './utils.js';
 import type { SupportedLanguages } from 'gitnexus-shared';
 
@@ -35,6 +35,9 @@ export interface ImportConfigs {
   csharpConfigs: CSharpProjectConfig[];
   /** In-repo namespace evidence gating C# suffix-fallback resolution (#1881). */
   csharpNamespaces?: CSharpNamespaceEvidence;
+  /** Zig `.path` deps from build.zig.zon. Optional so call sites that
+   *  hand-build ImportConfigs (tests) don't have to supply it. */
+  zigBuildZon?: ZigBuildZonConfig | null;
 }
 
 /** Pre-built lookup structures for import resolution. Build once, reuse across chunks. */
