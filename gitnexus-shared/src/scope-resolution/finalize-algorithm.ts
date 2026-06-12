@@ -790,6 +790,7 @@ const CALLABLE_OR_TYPE_LIKE: ReadonlySet<string> = new Set([
   'Interface',
   'Enum',
   'Struct',
+  'Union',
   'Record',
   'Trait',
   'Namespace',
