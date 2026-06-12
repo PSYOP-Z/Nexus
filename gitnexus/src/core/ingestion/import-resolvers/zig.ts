@@ -31,7 +31,7 @@ const ZIG_STDLIB_NAMES = new Set(['std', 'builtin', 'root']);
 export function resolveZigImportInternal(
   currentFile: string,
   importPath: string,
-  allFiles: Set<string>,
+  allFiles: ReadonlySet<string>,
   buildZon?: ZigBuildZonConfig | null,
 ): string | null {
   // Stdlib / compiler builtin / root — not resolvable from source files alone.
