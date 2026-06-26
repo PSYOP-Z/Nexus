@@ -59,7 +59,7 @@ function output(data: any): void {
 }
 
 export async function queryCommand(
-  queryText: string,
+  queryText: string | undefined,
   options?: {
     query?: string;
     repo?: string;
@@ -80,7 +80,7 @@ export async function queryCommand(
     query: resolvedQuery,
     task_context: options?.context,
     goal: options?.goal,
-    limit: options?.limit ? parseInt(options.limit) : undefined,
+    limit: options?.limit ? Math.max(0, parseInt(options.limit, 10)) : undefined,
     include_content: options?.content ?? false,
     repo: options?.repo,
   });
@@ -111,15 +111,15 @@ export async function contextCommand(
     include_content: options?.content ?? false,
     repo: options?.repo,
   });
-  if (limit) {
-    if (result.incoming?.calls && Array.isArray(result.incoming.calls))
-      result.incoming.calls = result.incoming.calls.slice(0, limit);
-    if (result.outgoing?.calls && Array.isArray(result.outgoing.calls))
-      result.outgoing.calls = result.outgoing.calls.slice(0, limit);
-    if (result.outgoing?.accesses && Array.isArray(result.outgoing.accesses))
-      result.outgoing.accesses = result.outgoing.accesses.slice(0, limit);
-    if (Array.isArray(result.processes)) result.processes = result.processes.slice(0, limit);
-  }
+    if (limit !== undefined) {
+      if (result.incoming?.calls && Array.isArray(result.incoming.calls))
+        result.incoming.calls = result.incoming.calls.slice(0, limit);
+      if (result.outgoing?.calls && Array.isArray(result.outgoing.calls))
+        result.outgoing.calls = result.outgoing.calls.slice(0, limit);
+      if (result.outgoing?.accesses && Array.isArray(result.outgoing.accesses))
+        result.outgoing.accesses = result.outgoing.accesses.slice(0, limit);
+      if (Array.isArray(result.processes)) result.processes = result.processes.slice(0, limit);
+    }
   output(result);
 }
 
@@ -148,7 +148,7 @@ export async function impactCommand(
       includeTests: options?.includeTests ?? false,
       repo: options?.repo,
     });
-    if (limit) {
+    if (limit !== undefined) {
       if (Array.isArray(result.affected_processes))
         result.affected_processes = result.affected_processes.slice(0, limit);
       if (Array.isArray(result.affected_modules))
@@ -193,7 +193,7 @@ export async function cypherCommand(
     query,
     repo: options?.repo,
   });
-  if (limit) {
+  if (limit !== undefined) {
     if (Array.isArray(result)) {
       result.splice(limit);
     } else if (result && typeof result === 'object' && typeof result.row_count === 'number') {
@@ -218,7 +218,7 @@ export async function detectChangesCommand(options?: {
     base_ref: options?.baseRef,
     repo: options?.repo,
   });
-  if (limit) {
+  if (limit !== undefined) {
     if (Array.isArray(result.changed_symbols))
       result.changed_symbols = result.changed_symbols.slice(0, limit);
     if (Array.isArray(result.affected_processes))
