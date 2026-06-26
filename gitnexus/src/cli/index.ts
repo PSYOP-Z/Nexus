@@ -200,8 +200,9 @@ program
 // These invoke LocalBackend directly for use in eval, scripts, and CI.
 
 program
-  .command('query <search_query>')
+  .command('query [search_query]')
   .description('Search the knowledge graph for execution flows related to a concept')
+  .option('-q, --query <text>', 'Search query (alias for positional argument)')
   .option('-r, --repo <name>', 'Target repository (omit if only one indexed)')
   .option('-c, --context <text>', 'Task context to improve ranking')
   .option('-g, --goal <text>', 'What you want to find')
@@ -215,6 +216,7 @@ program
   .option('-r, --repo <name>', 'Target repository')
   .option('-u, --uid <uid>', 'Direct symbol UID (zero-ambiguity lookup)')
   .option('-f, --file <path>', 'File path to disambiguate common names')
+  .option('-l, --limit <n>', 'Max callers/callees/processes to return')
   .option('--content', 'Include full symbol source code')
   .action(createLazyAction(() => import('./tool.js'), 'contextCommand'));
 
@@ -224,6 +226,7 @@ program
   .option('-d, --direction <dir>', 'upstream (dependants) or downstream (dependencies)', 'upstream')
   .option('-r, --repo <name>', 'Target repository')
   .option('--depth <n>', 'Max relationship depth (default: 3)')
+  .option('-l, --limit <n>', 'Max upstream/downstream results to return')
   .option('--include-tests', 'Include test files in results')
   .action(createLazyAction(() => import('./tool.js'), 'impactCommand'));
 
@@ -231,6 +234,7 @@ program
   .command('cypher <query>')
   .description('Execute raw Cypher query against the knowledge graph')
   .option('-r, --repo <name>', 'Target repository')
+  .option('-l, --limit <n>', 'Max result rows to return')
   .action(createLazyAction(() => import('./tool.js'), 'cypherCommand'));
 
 program
@@ -240,6 +244,7 @@ program
   .option('-s, --scope <scope>', 'What to analyze: unstaged, staged, all, or compare', 'unstaged')
   .option('-b, --base-ref <ref>', 'Branch/commit for compare scope (e.g. main)')
   .option('-r, --repo <name>', 'Target repository')
+  .option('-l, --limit <n>', 'Max changed symbols to return')
   .action(createLazyAction(() => import('./tool.js'), 'detectChangesCommand'));
 
 // ─── Eval Server (persistent daemon for SWE-bench) ─────────────────
