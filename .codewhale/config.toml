@@ -1,0 +1,8 @@
+# CodeWhale configuration for GitNexus
+# GitNexus is a TypeScript code search + MCP server (npm gitnexus v1.6.5).
+# See AGENTS.md for project rules and scope.
+
+default_text_model = "deepseek-v4-flash"
+reasoning_effort = "auto"
+
+# GitNexus MCP server is configured in mcp.json alongside this file.
