@@ -2,10 +2,21 @@ import { describe, it, expect, vi } from 'vitest';
 import Parser from 'tree-sitter';
 import TypeScript from 'tree-sitter-typescript';
 import { collectFunctionCfgs } from '../../../src/core/ingestion/cfg/collect.js';
-import { emitFileCfgs, emitFileReachingDefs } from '../../../src/core/ingestion/cfg/emit.js';
+import {
+  emitFileCfgs,
+  emitFileReachingDefs,
+  emitFileCdg,
+  POST_DOMINATE_DEBUG_ENV,
+} from '../../../src/core/ingestion/cfg/emit.js';
+import { decodeReachingDefReason } from '../../../src/core/ingestion/cfg/reaching-def-reason-codec.js';
 import { getProvider } from '../../../src/core/ingestion/languages/index.js';
 import { SupportedLanguages } from '../../../src/config/supported-languages.js';
-import type { CfgVisitor, FunctionCfg } from '../../../src/core/ingestion/cfg/types.js';
+import type {
+  BasicBlockData,
+  CfgEdgeData,
+  CfgVisitor,
+  FunctionCfg,
+} from '../../../src/core/ingestion/cfg/types.js';
 import type { SyntaxNode } from '../../../src/core/ingestion/utils/ast-helpers.js';
 import type { KnowledgeGraph } from '../../../src/core/graph/types.js';
 
@@ -102,6 +113,35 @@ describe('U4 — emitFileCfgs node/edge shape', () => {
   });
 });
 
+describe('collectFunctionCfgs — lineOffset → file coordinates (#2195 P1, Vue SFC)', () => {
+  it('shifts functionStartLine + block + statement lines by lineOffset', () => {
+    const code = `function f(x: number) { if (x) { a(); } else { b(); } }`;
+    const base = collectFunctionCfgs(tsRoot(code), visitor(), 'x.vue').cfgs;
+    const shifted = collectFunctionCfgs(tsRoot(code), visitor(), 'x.vue', 0, 5).cfgs;
+    expect(base.length).toBeGreaterThan(0);
+    expect(shifted).toHaveLength(base.length);
+    expect(shifted[0].functionStartLine).toBe(base[0].functionStartLine + 5);
+    expect(shifted[0].functionEndLine).toBe(base[0].functionEndLine + 5);
+    // functionStartColumn is a COLUMN, not a line — unchanged.
+    expect(shifted[0].functionStartColumn).toBe(base[0].functionStartColumn);
+    for (let i = 0; i < base[0].blocks.length; i++) {
+      expect(shifted[0].blocks[i].startLine).toBe(base[0].blocks[i].startLine + 5);
+      expect(shifted[0].blocks[i].endLine).toBe(base[0].blocks[i].endLine + 5);
+    }
+    // per-statement source lines shift too (file-accurate taint/explain hops).
+    const stmtLines = (cfgs: readonly FunctionCfg[]): number[] =>
+      cfgs[0].blocks.flatMap((b) => (b.statements ?? []).map((s) => s.line));
+    expect(stmtLines(shifted)).toEqual(stmtLines(base).map((l) => l + 5));
+  });
+
+  it('lineOffset 0 is a byte-identical no-op (non-embedded files unchanged)', () => {
+    const code = `function g() { while (true) { tick(); } }`;
+    const withZero = collectFunctionCfgs(tsRoot(code), visitor(), 'g.ts', 0, 0).cfgs;
+    const omitted = collectFunctionCfgs(tsRoot(code), visitor(), 'g.ts').cfgs;
+    expect(JSON.stringify(withZero)).toBe(JSON.stringify(omitted));
+  });
+});
+
 describe('U4 — AC2: every BasicBlock is reachable from its function ENTRY', () => {
   // Fixtures deliberately contain no dead code, so the reachability closure
   // from each function's ENTRY (block index 0) must cover all of its blocks.
@@ -181,7 +221,7 @@ describe('U4 — flag-off / empty input emits nothing', () => {
 });
 
 describe('U4 (#2082 M2) — emitFileReachingDefs', () => {
-  it('persists deduped (blockPair, binding) edges with reason = plain variable name', () => {
+  it('persists deduped (blockPair, binding) edges; reason decodes to the variable name + FU-B-2 def/use lines', () => {
     const cfgs = cfgsOf(
       `function f(a) {
         let x = a;
@@ -199,10 +239,24 @@ describe('U4 (#2082 M2) — emitFileReachingDefs', () => {
       expect(e.sourceId).toMatch(/^BasicBlock:src\/rd\.ts:\d+:\d+:\d+$/);
       expect(e.targetId).toMatch(/^BasicBlock:src\/rd\.ts:\d+:\d+:\d+$/);
     }
-    // reason carries the plain source-level name (M0/S1 verdict)
-    const reasons = new Set(rels.map((e) => e.reason));
-    expect(reasons.has('x')).toBe(true);
-    expect(reasons.has('a')).toBe(true);
+    // FU-B-2: reason carries the plain source-level name FIRST (M0/S1 verdict)
+    // plus a versioned def/use-line annotation — decode to recover the name.
+    const names = new Set(rels.map((e) => decodeReachingDefReason(e.reason).name));
+    expect(names.has('x')).toBe(true);
+    expect(names.has('a')).toBe(true);
+    // Every emitted edge carries the FU-B-2 line annotation (round-trips to
+    // finite 1-based def/use source lines) — the substrate the statement-granular
+    // projection walks.
+    const decoded = rels.map((e) => decodeReachingDefReason(e.reason));
+    for (const d of decoded) {
+      expect(typeof d.defLine).toBe('number');
+      expect(typeof d.useLine).toBe('number');
+    }
+    // The self-edge for `x` (def `let x = a` line 2 → use `x = x + 1` line 3)
+    // captures the intra-block def@L→use@L' chain the block-pair dedup would lose.
+    const xSelf = decoded.find((d) => d.name === 'x' && d.defLine !== d.useLine);
+    expect(xSelf).toMatchObject({ name: 'x' });
+    expect(Number(xSelf?.useLine)).toBeGreaterThan(Number(xSelf?.defLine));
   });
 
   it('same block pair, two bindings → two distinct edges (id collision-proofing)', () => {
@@ -212,7 +266,10 @@ describe('U4 (#2082 M2) — emitFileReachingDefs', () => {
     const ids = rels.map((e) => e.id);
     expect(new Set(ids).size).toBe(ids.length);
     // a and b both flow ENTRY→body: same block pair, distinct edges by binding
-    const entryToBody = rels.filter((e) => e.reason === 'a' || e.reason === 'b');
+    const entryToBody = rels.filter((e) => {
+      const name = decodeReachingDefReason(e.reason).name;
+      return name === 'a' || name === 'b';
+    });
     expect(entryToBody.length).toBeGreaterThanOrEqual(2);
   });
 
@@ -228,7 +285,7 @@ describe('U4 (#2082 M2) — emitFileReachingDefs', () => {
     );
     const { graph, rels } = recordingGraph();
     const r = emitFileReachingDefs(graph, cfgs);
-    const xEdges = rels.filter((e) => e.reason === 'x');
+    const xEdges = rels.filter((e) => decodeReachingDefReason(e.reason).name === 'x');
     expect(xEdges).toHaveLength(1); // self-pair within the single body block
     expect(r.facts).toBeGreaterThan(rels.length); // facts > deduped edges
   });
@@ -336,5 +393,158 @@ describe('U4 (#2082 M2) — emitFileReachingDefs', () => {
     // ids deterministic ⇒ the second pass produces the SAME ids (the real
     // KnowledgeGraph would no-op them; the recorder shows them duplicated)
     expect(rels.slice(firstIds.length).map((e) => e.id)).toEqual(firstIds);
+  });
+});
+
+describe('U4 (#2085 M5) — emitFileCdg', () => {
+  it('emits CDG edges between BasicBlocks with the branch label in reason', () => {
+    // if/else diamond → both arms control-dependent on the branch (T and F)
+    const cfgs = cfgsOf(
+      `function f(x: number) { if (x) { a(); } else { b(); } c(); }`,
+      'src/cdg.ts',
+    );
+    const { graph, rels } = recordingGraph();
+    const r = emitFileCdg(graph, cfgs);
+
+    expect(r.edges).toBe(rels.length);
+    expect(rels.length).toBeGreaterThan(0);
+    for (const e of rels) {
+      expect(e.type).toBe('CDG');
+      expect(e.sourceId).toMatch(/^BasicBlock:src\/cdg\.ts:\d+:\d+:\d+$/);
+      expect(e.targetId).toMatch(/^BasicBlock:src\/cdg\.ts:\d+:\d+:\d+$/);
+      expect(['T', 'F']).toContain(e.reason); // label rides reason (KTD3)
+    }
+    const labels = new Set(rels.map((e) => e.reason));
+    expect(labels.has('T')).toBe(true);
+    expect(labels.has('F')).toBe(true);
+    expect(r.postDominateEdges).toBe(0); // debug env off
+  });
+
+  it('a straight-line function has no control dependence', () => {
+    const cfgs = cfgsOf(`function f() { a(); b(); c(); }`, 'lin.ts');
+    const { graph, rels } = recordingGraph();
+    const r = emitFileCdg(graph, cfgs);
+    expect(rels).toHaveLength(0);
+    expect(r.edges).toBe(0);
+  });
+
+  it('deduped edge ids are unique and deterministic across runs', () => {
+    const cfgs = cfgsOf(
+      `function f(x: number, y: number) { if (x) { if (y) { a(); } else { b(); } } else { c(); } }`,
+      'det.ts',
+    );
+    const first = recordingGraph();
+    emitFileCdg(first.graph, cfgs);
+    const ids = first.rels.map((e) => e.id);
+    expect(new Set(ids).size).toBe(ids.length); // no id collisions
+    const second = recordingGraph();
+    emitFileCdg(second.graph, cfgs);
+    expect(second.rels.map((e) => e.id)).toEqual(ids); // deterministic
+  });
+
+  it('per-function edge cap stops at the cap, records the drop, and warns (R6)', () => {
+    const cfgs = cfgsOf(
+      `function f(x: number, y: number) { if (x) { if (y) { a(); } else { b(); } } else { c(); } }`,
+      'cap.ts',
+    );
+    const full = recordingGraph();
+    const total = emitFileCdg(full.graph, cfgs).edges;
+    expect(total).toBeGreaterThan(1);
+
+    const { graph, rels } = recordingGraph();
+    const onWarn = vi.fn();
+    const r = emitFileCdg(graph, cfgs, 1, onWarn);
+    expect(rels.length).toBe(1); // emitted exactly the cap
+    expect(r.droppedEdges).toBe(total - 1);
+    expect(r.cappedFunctions).toBe(1);
+    expect(onWarn).toHaveBeenCalledTimes(1);
+    expect(onWarn.mock.calls[0][0]).toContain('CDG edge cap');
+  });
+
+  it('cap of 0 means unlimited (no warning)', () => {
+    const cfgs = cfgsOf(`function f(x: number) { if (x) { a(); } else { b(); } }`, 'u.ts');
+    const { graph, rels } = recordingGraph();
+    const onWarn = vi.fn();
+    const r = emitFileCdg(graph, cfgs, 0, onWarn);
+    expect(rels.length).toBe(r.edges);
+    expect(r.droppedEdges).toBe(0);
+    expect(onWarn).not.toHaveBeenCalled();
+  });
+
+  it('skips CDG for a CFG whose EXIT is unreachable from all blocks (#2188 unsound guard)', () => {
+    // Hand-built exit-less loop: 0=entry → 1 ⇄ 2 spin forever; 3=exit is
+    // disconnected. Post-dominance would be unsound there, so CDG is skipped —
+    // while a normal sibling function in the same batch still emits CDG.
+    const blocks: BasicBlockData[] = [0, 1, 2, 3].map((i) => ({
+      index: i,
+      startLine: i + 1,
+      endLine: i + 1,
+      text: '',
+      kind: i === 0 ? 'entry' : i === 3 ? 'exit' : 'normal',
+    }));
+    const edges: CfgEdgeData[] = [
+      { from: 0, to: 1, kind: 'seq' },
+      { from: 1, to: 2, kind: 'seq' },
+      { from: 2, to: 1, kind: 'seq' },
+    ];
+    const unsound: FunctionCfg = {
+      filePath: 'spin.ts',
+      functionStartLine: 1,
+      functionStartColumn: 0,
+      entryIndex: 0,
+      exitIndex: 3,
+      blocks,
+      edges,
+    };
+    const sound = cfgsOf(
+      `function f(x: number) { if (x) { a(); } else { b(); } c(); }`,
+      'sound.ts',
+    )[0];
+
+    const { graph, rels } = recordingGraph();
+    const onWarn = vi.fn();
+    const r = emitFileCdg(graph, [unsound, sound], 0, onWarn);
+
+    expect(r.skippedUnsoundFunctions).toBe(1);
+    // No CDG edge originates from the unsound function...
+    expect(rels.some((e) => e.sourceId.startsWith('BasicBlock:spin.ts:'))).toBe(false);
+    // ...but the sound sibling still emitted CDG normally.
+    expect(rels.length).toBeGreaterThan(0);
+    expect(rels.every((e) => e.sourceId.startsWith('BasicBlock:sound.ts:'))).toBe(true);
+    expect(r.edges).toBe(rels.length);
+    expect(onWarn).toHaveBeenCalledTimes(1);
+    expect(onWarn.mock.calls[0][0]).toContain('EXIT not reachable');
+  });
+
+  it('emits POST_DOMINATE debug edges only when the env flag is set (KTD8)', () => {
+    const cfgs = cfgsOf(`function f(x: number) { if (x) { a(); } else { b(); } c(); }`, 'pd.ts');
+
+    // flag unset → no POST_DOMINATE edges
+    const off = recordingGraph();
+    const rOff = emitFileCdg(off.graph, cfgs);
+    expect(off.rels.some((e) => e.type === 'POST_DOMINATE')).toBe(false);
+    expect(rOff.postDominateEdges).toBe(0);
+
+    // flag set → POST_DOMINATE edges appear (not counted against CDG cap)
+    const prev = process.env[POST_DOMINATE_DEBUG_ENV];
+    process.env[POST_DOMINATE_DEBUG_ENV] = '1';
+    try {
+      const on = recordingGraph();
+      const rOn = emitFileCdg(on.graph, cfgs);
+      const pd = on.rels.filter((e) => e.type === 'POST_DOMINATE');
+      expect(pd.length).toBeGreaterThan(0);
+      expect(rOn.postDominateEdges).toBe(pd.length);
+      // CDG edge count is unchanged by the debug flag
+      expect(rOn.edges).toBe(rOff.edges);
+
+      // the case-insensitive 'true' OR-branch of postDominateDebugEnabled
+      process.env[POST_DOMINATE_DEBUG_ENV] = 'TRUE';
+      const onTrue = recordingGraph();
+      const rOnTrue = emitFileCdg(onTrue.graph, cfgs);
+      expect(rOnTrue.postDominateEdges).toBeGreaterThan(0);
+    } finally {
+      if (prev === undefined) delete process.env[POST_DOMINATE_DEBUG_ENV];
+      else process.env[POST_DOMINATE_DEBUG_ENV] = prev;
+    }
   });
 });

@@ -63,6 +63,15 @@ export const canonicalizePath = (p: string): string => {
   }
 };
 
+/**
+ * Compare two already-canonicalised registry paths. Case-insensitive on Windows
+ * (its filesystem is), case-sensitive elsewhere. Both arguments must already be
+ * run through {@link canonicalizePath}; this is the single comparison the registry
+ * lookups/dedup/finalize checks all share so they answer identically.
+ */
+export const registryPathEquals = (a: string, b: string): boolean =>
+  process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+
 export interface RepoMeta {
   repoPath: string;
   lastCommit: string;
@@ -164,13 +173,91 @@ export interface RepoMeta {
      * type for that reason; resolved (always present) on every M2+ write.
      */
     maxReachingDefEdgesPerFunction?: number;
+    /**
+     * Emit-side per-function CDG (control-dependence) edge cap, resolved
+     * (0 = unlimited; #2085 M5). ABSENT on any pre-M5 stamp — that absence is
+     * what trips `pdgModeMismatch` on the first CDG-aware run and forces the
+     * full writeback that materialises CDG edges. Optional for that upgrade
+     * reason; resolved (always present) on every M5+ write.
+     */
+    maxCdgEdgesPerFunction?: number;
+    /**
+     * Per-function taint findings cap, resolved (0 = unlimited; #2083 M3).
+     * ABSENT on an M1/M2-era stamp — like `maxReachingDefEdgesPerFunction`,
+     * that absence is what trips `pdgModeMismatch` on the first M3 run and
+     * forces the full writeback that populates TAINTED/SANITIZES rows.
+     */
+    maxTaintFindingsPerFunction?: number;
+    /** Per-finding taint hop cap, resolved (0 = unlimited; #2083 M3 KTD6 —
+     *  bounds the persisted hop-encoded `reason`). Optional for the same
+     *  M2-era-stamp upgrade reason as the findings cap. */
+    maxTaintHops?: number;
+    /**
+     * Per-run cross-function caps, resolved (0 = unlimited; #2084 M4 review
+     * P1-3). ABSENT on an M3-era stamp — that absence trips `pdgModeMismatch`
+     * on the first run that adds them and forces the full writeback that
+     * re-materialises TAINT_PATH within bounds. Optional for that upgrade
+     * reason; resolved (always present) on every post-fix write.
+     */
+    maxInterprocFindings?: number;
+    maxInterprocHops?: number;
+    maxInterprocEdges?: number;
+    /**
+     * Digest of the built-in taint model the persisted findings were
+     * produced under (#2083 M3 KTD7/R7). Any model-content change ships a
+     * new digest → mismatch → full writeback repopulates taint edges
+     * without `--force`. Optional: absent on pre-M3 stamps.
+     */
+    taintModelVersion?: string;
+    /**
+     * Identity of the reaching-definitions solver the persisted REACHING_DEF
+     * rows were produced under (#2201 review R3). The SSA-sparse rewrite computes
+     * FULL facts for deep-loop functions the old dense worklist truncated to
+     * empty (the blocks×64 ceiling no longer fires) — but an existing `--pdg`
+     * index built under the old solver carries those truncated rows. ABSENT on
+     * any pre-#2201 stamp, so that absence trips `pdgModeMismatch` on the first
+     * upgraded run and forces the full writeback that recomputes the now-fuller
+     * REACHING_DEF coverage without `--force`. Bump the tag on any future change
+     * that alters which facts the solver emits. Optional for that upgrade reason;
+     * resolved (always present) on every post-#2201 write.
+     */
+    reachingDefSolver?: string;
+    /**
+     * Whether this `--pdg` index recorded the FU-C `CALL_SUMMARY` return-value
+     * ascent layer (per-callee param→return summary edges). `true` on every
+     * FU-C+ (v4) write. ABSENT on any pre-FU-C (v3) `--pdg` stamp — that absence
+     * is what tells `impact`'s PDG mode the index predates CALL_SUMMARY, so it
+     * surfaces a "no return-value ascent (re-index for CALL_SUMMARY)" note while
+     * STILL serving the intra slice. CALL_SUMMARY is deliberately NOT a required
+     * sub-layer for `pdgLayerStatus` to report `'ready'`: a v3 index stays fully
+     * usable for the intra-procedural statement slice; only the ascent upgrade is
+     * unavailable. Optional for that back-compat reason.
+     */
+    hasCallSummary?: boolean;
   };
 }
 
 /**
  * Bumped whenever incremental-indexing invariants change incompatibly.
+ * v2: `BasicBlock.callees` column added (statement-precise inter-procedural
+ * reach substrate) — an index built before this lacks the column, so a full
+ * re-analyze is required rather than an incremental top-up.
+ * v3: `BasicBlock.calleeIds` column added (sound resolved-callee-id parallel
+ * to `callees`, #2227) — same contract: an index built before this lacks the
+ * column, so a full re-analyze is forced rather than an incremental top-up.
+ * v4: `CALL_SUMMARY` relation type added (per-callee RETURN-VALUE ASCENT
+ * summary edges, PDG FU-C). A pre-v4 `--pdg` index has NO CALL_SUMMARY edges,
+ * so the engine would silently UNDER-REPORT return-value ascent on an
+ * incremental top-up; force a full re-analyze instead (same contract as v2/v3).
+ * This single bump covers the whole FU-C re-index window (and the later FU-B-2).
+ * v5: `Route` node identity changed to `(method, url)` (#2289 — a same-URL
+ * GET/POST pair is now two distinct Route nodes). Every declarative-route node
+ * id moved from `Route:/x` to `Route:GET /x` (filesystem routes keep their
+ * URL-only id). The incremental writeback preserves unchanged-file rows, so a
+ * top-up against a pre-v5 index would strand old url-keyed Route nodes alongside
+ * new composite-keyed ones — force a full re-analyze instead.
  */
-export const INCREMENTAL_SCHEMA_VERSION = 1;
+export const INCREMENTAL_SCHEMA_VERSION = 5;
 
 export interface IndexedRepo {
   repoPath: string;
@@ -643,7 +730,7 @@ export const registerRepo = async (
     // to a stable key instead of throwing.
     const a = canonicalizePath(e.path);
     const b = canonicalInput;
-    return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+    return registryPathEquals(a, b);
   });
   const existing = existingIdx >= 0 ? entries[existingIdx] : null;
 
@@ -751,9 +838,7 @@ export const registerRepo = async (
   const fresh = await readRegistry();
   const freshIdx = fresh.findIndex((e) => {
     const a = canonicalizePath(e.path);
-    return process.platform === 'win32'
-      ? a.toLowerCase() === canonicalInput.toLowerCase()
-      : a === canonicalInput;
+    return registryPathEquals(a, canonicalInput);
   });
   const freshExisting = freshIdx >= 0 ? fresh[freshIdx] : null;
   let merged: RegistryEntry;
@@ -792,9 +877,7 @@ export const unregisterRepo = async (repoPath: string): Promise<void> => {
   // `resolveRegistryEntry` post-#1003 review.
   const resolved = canonicalizePath(repoPath);
   const entries = await readRegistry();
-  const matches = (a: string, b: string) =>
-    process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
-  const filtered = entries.filter((e) => !matches(canonicalizePath(e.path), resolved));
+  const filtered = entries.filter((e) => !registryPathEquals(canonicalizePath(e.path), resolved));
   await writeRegistry(filtered);
 };
 
@@ -808,10 +891,8 @@ export const unregisterRepo = async (repoPath: string): Promise<void> => {
  */
 export const removeBranchIndex = async (repoPath: string, branch: string): Promise<boolean> => {
   const resolved = canonicalizePath(repoPath);
-  const matches = (a: string, b: string) =>
-    process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
   const entries = await readRegistry();
-  const idx = entries.findIndex((e) => matches(canonicalizePath(e.path), resolved));
+  const idx = entries.findIndex((e) => registryPathEquals(canonicalizePath(e.path), resolved));
   if (idx < 0) return false;
   const entry = entries[idx];
   const before = entry.branches?.length ?? 0;
@@ -913,6 +994,18 @@ export class AnalysisNotFinalizedError extends Error {
 }
 
 /**
+ * True when the global registry already contains an entry whose canonical path
+ * matches `repoPath`. Uses the same canonical, case-folded (Windows) comparison
+ * as {@link assertAnalysisFinalized} so "is it registered?" answers identically
+ * at the analyze fast-path gate and at the finalize assertion. Pure read.
+ */
+export const isRepoRegistered = async (repoPath: string): Promise<boolean> => {
+  const entries = await readRegistry();
+  const canonicalInput = canonicalizePath(path.resolve(repoPath));
+  return entries.some((e) => registryPathEquals(canonicalizePath(e.path), canonicalInput));
+};
+
+/**
  * Verify that a successful `analyze` call actually produced an indexed,
  * registered repo on disk. Two checks, both strictly required:
  *
@@ -936,14 +1029,7 @@ export const assertAnalysisFinalized = async (repoPath: string): Promise<void> =
     throw new AnalysisNotFinalizedError(resolved, storagePath, 'meta', getGlobalRegistryPath());
   }
 
-  const entries = await readRegistry();
-  const canonicalInput = canonicalizePath(resolved);
-  const isWin = process.platform === 'win32';
-  const found = entries.some((e) => {
-    const a = canonicalizePath(e.path);
-    return isWin ? a.toLowerCase() === canonicalInput.toLowerCase() : a === canonicalInput;
-  });
-  if (!found) {
+  if (!(await isRepoRegistered(resolved))) {
     throw new AnalysisNotFinalizedError(
       resolved,
       storagePath,
@@ -1059,7 +1145,7 @@ export const resolveRegistryEntry = (entries: RegistryEntry[], target: string): 
   const pathMatch = entries.find((e) => {
     const a = canonicalizePath(e.path);
     const b = canonicalTarget;
-    return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+    return registryPathEquals(a, b);
   });
   if (pathMatch) return pathMatch;
 

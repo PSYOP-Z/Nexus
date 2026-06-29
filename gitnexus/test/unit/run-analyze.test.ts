@@ -7,7 +7,13 @@ import {
   deriveEmbeddingCap,
   DEFAULT_EMBEDDING_NODE_LIMIT,
 } from '../../src/core/embedding-mode.js';
-import { getStoragePaths, saveMeta, type RepoMeta } from '../../src/storage/repo-manager.js';
+import {
+  getStoragePaths,
+  saveMeta,
+  INCREMENTAL_SCHEMA_VERSION,
+  type RepoMeta,
+} from '../../src/storage/repo-manager.js';
+import { taintModelVersion } from '../../src/core/ingestion/taint/typescript-model.js';
 import { createTempDir } from '../helpers/test-db.js';
 
 describe('run-analyze module', () => {
@@ -39,6 +45,10 @@ describe('run-analyze module', () => {
         repoPath: tmpRepo.dbPath,
         lastCommit: currentCommit,
         indexedAt: new Date().toISOString(),
+        // Stamp current schema version so the run-analyze schema-mismatch
+        // guard (#2289 P1) does not force a rebuild and short-circuit the
+        // alreadyUpToDate fast path this test exercises.
+        schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       };
       await saveMeta(storagePath, meta);
 
@@ -78,12 +88,16 @@ describe('run-analyze module', () => {
       }).trim();
 
       // Flat slot owned by main; feature/x has its own up-to-date branch index.
+      // Both metas stamp the current schema version so the run-analyze
+      // schema-mismatch guard (#2289 P1) does not force a rebuild before the
+      // fast path runs.
       const flat = getStoragePaths(tmpRepo.dbPath);
       await saveMeta(flat.storagePath, {
         repoPath: tmpRepo.dbPath,
         lastCommit: commit,
         indexedAt: new Date().toISOString(),
         branch: 'main',
+        schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       });
       const branch = getStoragePaths(tmpRepo.dbPath, 'feature/x');
       await saveMeta(path.dirname(branch.metaPath), {
@@ -91,6 +105,7 @@ describe('run-analyze module', () => {
         lastCommit: commit,
         indexedAt: new Date().toISOString(),
         branch: 'feature/x',
+        schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       });
 
       const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
@@ -330,13 +345,31 @@ describe('deriveEmbeddingCap', () => {
 });
 
 describe('pdgModeMismatch / resolvePdgConfig (#2099 F1)', () => {
-  // M2 (#2082) added the resolved REACHING_DEF cap to the stamp; these tests
-  // model M2 STEADY-STATE equality. The M1-era-stamp (field absent) upgrade
-  // path is pinned in pdg-mode-flip.test.ts.
+  // M2 (#2082) added the resolved REACHING_DEF cap to the stamp; M3 (#2083)
+  // added the two taint caps + the built-in model digest. These tests model
+  // M3 STEADY-STATE equality — this object is the DELIBERATE pin of the
+  // resolved-record shape, updated per milestone. The era-stamp (field
+  // absent) upgrade paths are pinned in pdg-mode-flip.test.ts.
   const DEFAULTS = {
     maxFunctionLines: 2000,
     maxEdgesPerFunction: 5000,
     maxReachingDefEdgesPerFunction: 4000,
+    maxCdgEdgesPerFunction: 5000,
+    maxTaintFindingsPerFunction: 200,
+    maxTaintHops: 32,
+    maxInterprocFindings: 2000,
+    maxInterprocHops: 32,
+    maxInterprocEdges: 1000,
+    // Content digest, not a tunable cap — pinned via the exported constant
+    // (its VALUE changes whenever the built-in model changes, by design).
+    taintModelVersion,
+    // Solver identity, not a tunable cap — always stamped on a pdg-on run
+    // (#2201 review R3). Bumps when the reaching-defs solver's emitted facts
+    // change; absence on a pre-#2201 stamp forces a re-analysis.
+    reachingDefSolver: 'ssa-sparse-v1',
+    // FU-C return-value-ascent layer presence — always stamped on a pdg-on run;
+    // absence on a pre-FU-C (v3) stamp forces a re-analysis (key-union mismatch).
+    hasCallSummary: true,
   };
 
   it('resolvePdgConfig: pdg-off run resolves to undefined (the meta field is omitted)', async () => {
@@ -354,8 +387,27 @@ describe('pdgModeMismatch / resolvePdgConfig (#2099 F1)', () => {
         pdgMaxFunctionLines: 0,
         pdgMaxEdgesPerFunction: 0,
         pdgMaxReachingDefEdgesPerFunction: 0,
+        pdgMaxCdgEdgesPerFunction: 0,
+        pdgMaxTaintFindingsPerFunction: 0,
+        pdgMaxTaintHops: 0,
+        pdgMaxInterprocFindings: 0,
+        pdgMaxInterprocHops: 0,
+        pdgMaxInterprocEdges: 0,
       }),
-    ).toEqual({ maxFunctionLines: 0, maxEdgesPerFunction: 0, maxReachingDefEdgesPerFunction: 0 });
+    ).toEqual({
+      maxFunctionLines: 0,
+      maxEdgesPerFunction: 0,
+      maxReachingDefEdgesPerFunction: 0,
+      maxCdgEdgesPerFunction: 0,
+      maxTaintFindingsPerFunction: 0,
+      maxTaintHops: 0,
+      maxInterprocFindings: 0,
+      maxInterprocHops: 0,
+      maxInterprocEdges: 0,
+      taintModelVersion, // not a cap — always stamped on a pdg-on run
+      reachingDefSolver: 'ssa-sparse-v1', // solver identity — always stamped (#2201 R3)
+      hasCallSummary: true, // FU-C ascent layer — always stamped on a pdg-on run
+    });
   });
 
   it('legacy meta (no recorded stamp) + plain run → no mismatch', async () => {
@@ -391,5 +443,11 @@ describe('pdgModeMismatch / resolvePdgConfig (#2099 F1)', () => {
     expect(pdgModeMismatch(DEFAULTS, { pdg: true, pdgMaxFunctionLines: 500 })).toBe(true);
     // 0 = unlimited differs from the 2000-line default, too.
     expect(pdgModeMismatch(DEFAULTS, { pdg: true, pdgMaxFunctionLines: 0 })).toBe(true);
+    // The M3 taint caps participate identically (#2083).
+    expect(pdgModeMismatch(DEFAULTS, { pdg: true, pdgMaxTaintFindingsPerFunction: 1 })).toBe(true);
+    expect(pdgModeMismatch(DEFAULTS, { pdg: true, pdgMaxTaintHops: 1 })).toBe(true);
+    expect(pdgModeMismatch(DEFAULTS, { pdg: true, pdgMaxTaintFindingsPerFunction: 200 })).toBe(
+      false, // explicit default ≡ default
+    );
   });
 });

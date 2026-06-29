@@ -55,6 +55,8 @@ export const en = {
   'tool.usage.context': 'Usage: gitnexus context <symbol_name> [--uid <uid>] [--file <path>]',
   'tool.usage.impact':
     'Usage: gitnexus impact <symbol_name> [--uid <uid>] [--file <path>] [--kind <kind>] [--direction upstream|downstream]',
+  'tool.usage.trace':
+    'Usage: gitnexus trace <from> <to> [--from-uid <uid>] [--to-uid <uid>] [--depth <n>]',
   'tool.usage.cypher': 'Usage: gitnexus cypher <cypher_query>',
   'tool.warn.unknownKind':
     "--kind '{{kind}}' is not a known symbol kind (e.g. Function, Class, Method); it will not narrow the result.",
@@ -122,7 +124,8 @@ export const en = {
   'help.command.index.description':
     'Register an existing .gitnexus/ folder into the global registry (no re-analysis needed)',
   'help.command.serve.description': 'Start local HTTP server for web UI connection',
-  'help.command.mcp.description': 'Start MCP server (stdio) — serves all indexed repos',
+  'help.command.mcp.description':
+    'Start MCP server. Default: stdio. Use --http for a remote HTTP server (Streamable HTTP at POST /mcp + legacy SSE at GET /sse, POST /messages).',
   'help.command.list.description': 'List all indexed repositories',
   'help.command.status.description': 'Show index status for current repo',
   'help.command.doctor.description':
@@ -140,9 +143,12 @@ export const en = {
   'help.command.context.description':
     '360-degree view of a code symbol: callers, callees, processes',
   'help.command.impact.description': 'Blast radius analysis: what breaks if you change a symbol',
+  'help.command.trace.description':
+    'Find the shortest directed path between two symbols (call + class-member edges)',
   'help.command.cypher.description': 'Execute raw Cypher query against the knowledge graph',
   'help.command.detectChanges.description':
     'Map git diff hunks to indexed symbols and affected execution flows',
+  'help.command.check.description': 'Run structural checks against the indexed graph',
   'help.command.evalServer.description':
     'Start lightweight HTTP server for fast tool calls during evaluation',
   'help.command.group.description': 'Manage repository groups for cross-index impact analysis',
@@ -158,6 +164,8 @@ export const en = {
     'Cross-repo impact for a symbol in one member repo of a group',
   'help.command.group.query.description': 'Search execution flows across all repos in a group',
   'help.command.group.contracts.description': 'Inspect Contract Registry',
+  'help.option.setup.codingAgent':
+    'Configure only these coding agents (comma-separated or repeatable)',
   'help.option.analyze.force': 'Force full re-index even if up to date',
   'help.option.analyze.repairFts': 'Repair/rebuild search FTS indexes without full re-analysis',
   'help.option.analyze.embeddings':
@@ -196,6 +204,11 @@ export const en = {
   'help.option.index.allowNonGit': 'Allow registering folders that are not Git repositories',
   'help.option.port': 'Port number',
   'help.option.serve.host': 'Bind address (default: 127.0.0.1, use 0.0.0.0 for remote access)',
+  'help.option.mcp.http': 'Serve MCP over HTTP instead of stdio (for remote clients)',
+  'help.option.mcp.host':
+    'HTTP bind address (only with --http). Default: 127.0.0.1 (loopback). Use 0.0.0.0 to expose to all interfaces.',
+  'help.option.mcp.authToken':
+    'Require this bearer token in the Authorization header (only with --http); may also be set via the GITNEXUS_MCP_AUTH_TOKEN env var. Required for a non-loopback bind (--host 0.0.0.0/::), which otherwise refuses to start.',
   'help.option.force.confirmation': 'Skip confirmation prompt',
   'help.option.uninstall.force': 'Apply the changes (default is a dry-run preview)',
   'help.option.clean.all': 'Clean all indexed repos',
@@ -239,8 +252,15 @@ export const en = {
   'help.option.impact.limit': 'Max symbols per depth level (default: 100)',
   'help.option.impact.offset': 'Skip N symbols per depth level for pagination',
   'help.option.impact.summaryOnly': 'Return counts and risk only, omit symbol list',
+  'help.option.trace.fromUid': 'Source symbol UID (zero-ambiguity lookup)',
+  'help.option.trace.fromFile': 'Source file path to disambiguate common names',
+  'help.option.trace.toUid': 'Target symbol UID (zero-ambiguity lookup)',
+  'help.option.trace.toFile': 'Target file path to disambiguate common names',
+  'help.option.trace.depth': 'Max path length in hops (default: 10)',
+  'help.option.trace.includeTests': 'Traverse through test-file symbols (default: false)',
   'help.option.detectChanges.scope': 'What to analyze: unstaged, staged, all, or compare',
   'help.option.detectChanges.baseRef': 'Branch/commit for compare scope (e.g. main)',
+  'help.option.check.cycles': 'Detect circular imports and fail when any are found',
   'help.option.evalServer.host':
     'Bind address (default: 127.0.0.1, use 0.0.0.0 to expose to all interfaces)',
   'help.option.evalServer.idleTimeout': 'Auto-shutdown after N seconds idle (0 = disabled)',

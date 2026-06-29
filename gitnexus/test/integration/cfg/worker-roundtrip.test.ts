@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { describe, it, expect } from 'vitest';
 import Parser from 'tree-sitter';
 import TypeScript from 'tree-sitter-typescript';
@@ -26,15 +27,17 @@ const tsVisitor = (): CfgVisitor<SyntaxNode> => {
   return v;
 };
 
-describe('U3 — TS/JS provider exposes a cfgVisitor; others do not (worker gate)', () => {
+describe('CFG provider gate — a cfgVisitor enables the worker CFG path', () => {
   it('TS and JS providers carry a cfgVisitor', () => {
     expect(getProvider(SupportedLanguages.TypeScript).cfgVisitor).toBeDefined();
     expect(getProvider(SupportedLanguages.JavaScript).cfgVisitor).toBeDefined();
   });
 
-  it('a non-CFG language (Python) has no cfgVisitor ⇒ worker emits no cfgSideChannel', () => {
+  it('a non-CFG language (COBOL) has no cfgVisitor ⇒ worker emits no cfgSideChannel', () => {
     // `provider.cfgVisitor &&` short-circuits in the worker → no CFG, no field.
-    expect(getProvider(SupportedLanguages.Python).cfgVisitor).toBeUndefined();
+    // COBOL is the deliberate non-goal of the PDG-language rollout (#2195) —
+    // every other supported language now carries a cfgVisitor.
+    expect(getProvider(SupportedLanguages.Cobol).cfgVisitor).toBeUndefined();
   });
 });
 
@@ -45,7 +48,7 @@ describe('U3 — collectFunctionCfgs', () => {
       function b() { return 1; }
     `);
     const { cfgs, skipped } = collectFunctionCfgs(root, tsVisitor(), 'a.ts');
-    expect(skipped).toBe(0);
+    expect(skipped).toEqual({ tooManyLines: 0, tooDeeplyNested: 0, buildError: 0 });
     expect(cfgs).toHaveLength(2);
     const a = cfgs.find((c) => c.blocks.some((bl) => bl.text.includes('p();')));
     expect(a).toBeDefined();
@@ -63,17 +66,55 @@ describe('U3 — collectFunctionCfgs', () => {
       'x.ts',
     );
     expect(cfgs).toHaveLength(0);
-    expect(skipped).toBe(0);
+    expect(skipped).toEqual({ tooManyLines: 0, tooDeeplyNested: 0, buildError: 0 });
   });
 
   it('maxFunctionLines skips an over-cap function and counts the skip', () => {
     const big = `function big() {\n${'  step();\n'.repeat(20)}}`;
     const root = tsRoot(`${big}\nfunction small() { ok(); }`);
     const { cfgs, skipped } = collectFunctionCfgs(root, tsVisitor(), 'f.ts', 5);
-    expect(skipped).toBe(1); // big() exceeds the 5-line cap
+    expect(skipped.tooManyLines).toBe(1); // big() exceeds the 5-line cap
+    expect(skipped.tooDeeplyNested).toBe(0);
+    expect(skipped.buildError).toBe(0);
     // small() is still built
     expect(cfgs.some((c) => c.blocks.some((bl) => bl.text.includes('ok();')))).toBe(true);
     expect(cfgs.some((c) => c.blocks.some((bl) => bl.text.includes('step();')))).toBe(false);
+  });
+
+  it('a pathologically deep nest is bailed proactively and counted (#2195)', () => {
+    // A function nested far past MAX_CFG_NESTING_DEPTH (real code is ≤ ~50 deep).
+    // The visitor's proactive guard throws CfgNestingDepthError; collect counts
+    // it under tooDeeplyNested and ISOLATES it — the sibling function still
+    // builds (the bail must not drop the whole file's CFGs).
+    const deep = `function deep() { ${'if (c) {'.repeat(1200)} leaf(); ${'}'.repeat(1200)} }`;
+    const root = tsRoot(`${deep}\nfunction sibling() { ok(); }`);
+    const { cfgs, skipped } = collectFunctionCfgs(root, tsVisitor(), 'deep.ts');
+    expect(skipped.tooDeeplyNested).toBe(1);
+    expect(skipped.tooManyLines).toBe(0);
+    expect(skipped.buildError).toBe(0);
+    // sibling() survives the bail
+    expect(cfgs.some((c) => c.blocks.some((bl) => bl.text.includes('ok();')))).toBe(true);
+    expect(cfgs.some((c) => c.blocks.some((bl) => bl.text.includes('leaf();')))).toBe(false);
+  });
+
+  it('isolates a generic build error to one function and counts it (buildError, #2195)', () => {
+    // A non-CfgNestingDepthError throw from buildFunctionCfg used to escape to the
+    // worker language-group catch and drop EVERY remaining file's CFG. It must now
+    // be caught per function, counted under buildError, and NOT stop the sibling.
+    const real = tsVisitor();
+    const flaky: CfgVisitor<SyntaxNode> = {
+      isFunction: (n) => real.isFunction(n),
+      buildFunctionCfg: (n, fp) => {
+        if (n.text.includes('boom()')) throw new Error('synthetic build failure');
+        return real.buildFunctionCfg(n, fp);
+      },
+    };
+    const root = tsRoot(`function bad() { boom(); }\nfunction good() { ok(); }`);
+    const { cfgs, skipped } = collectFunctionCfgs(root, flaky, 'be.ts');
+    expect(skipped).toEqual({ tooManyLines: 0, tooDeeplyNested: 0, buildError: 1 });
+    // good() still builds — the throw didn't drop the file's other CFGs
+    expect(cfgs.some((c) => c.blocks.some((bl) => bl.text.includes('ok();')))).toBe(true);
+    expect(cfgs.some((c) => c.blocks.some((bl) => bl.text.includes('boom();')))).toBe(false);
   });
 });
 
@@ -181,5 +222,113 @@ describe('#2082 M2 — the REACHING_DEF emit cap does NOT perturb the chunk key'
       maxReachingDefEdgesPerFunction: 1,
     });
     expect(withExtra).toBe(base);
+  });
+});
+
+describe('#2083 M3 U1 — taint sites cross the worker/store boundary intact', () => {
+  const siteSource = `function handler(req, x) {
+    const cp = require('child_process');
+    const b = req.body;
+    cp.exec(escape(x), b);
+    sql\`select \${x}\`;
+    run(...b);
+  }`;
+
+  function siteCfgs() {
+    const { cfgs } = collectFunctionCfgs(tsRoot(siteSource), tsVisitor(), 'sites.ts');
+    expect(cfgs).toHaveLength(1);
+    return cfgs;
+  }
+
+  function allSites(cfgs: readonly { blocks: readonly { statements?: readonly unknown[] }[] }[]) {
+    return cfgs.flatMap((c) =>
+      c.blocks.flatMap((b) =>
+        (b.statements ?? []).flatMap((s) => (s as { sites?: unknown[] }).sites ?? []),
+      ),
+    );
+  }
+
+  it('sites survive the worker JSON boundary (mapReplacer/mapReviver) byte-equal', () => {
+    const cfgs = siteCfgs();
+    expect(allSites(cfgs).length).toBeGreaterThan(0);
+    const round = JSON.parse(JSON.stringify(cfgs, mapReplacer), mapReviver);
+    expect(round).toEqual(cfgs);
+    expect(allSites(round)).toEqual(allSites(cfgs));
+  });
+
+  it('sites survive a frozen re-wrap + the DURABLE store interning reviver (no nodeId-dedup loss)', async () => {
+    const { makeInterningReviver } = await import('../../../src/storage/parsedfile-store.js');
+    const cfgs = siteCfgs();
+    // The pipeline deep-freezes ParsedFiles and re-wraps via spread — the CFG
+    // payload itself rides by reference and must tolerate being frozen.
+    const deepFreeze = (o: unknown): unknown => {
+      if (o && typeof o === 'object') {
+        for (const v of Object.values(o)) deepFreeze(v);
+        Object.freeze(o);
+      }
+      return o;
+    };
+    const frozen = (deepFreeze(cfgs) as typeof cfgs).map((c) => ({ ...c }));
+    const raw = JSON.stringify(frozen, mapReplacer);
+    // The durable parsedfile-cache revives with the interning reviver, which
+    // DEDUPS any object carrying a string `nodeId` field — SiteRecord must
+    // never trip it (the KTD2 "no field named nodeId" obligation).
+    const revived = JSON.parse(raw, makeInterningReviver(new Map(), new Map()));
+    expect(revived).toEqual(frozen);
+    expect(allSites(revived)).toEqual(allSites(cfgs));
+  });
+});
+
+describe('#2083 M3 U1 — pdg chunk-key namespace version (flag-off keys untouched)', () => {
+  const entries = [
+    { filePath: 'b.ts', contentHash: 'h2' },
+    { filePath: 'a.ts', contentHash: 'h1' },
+  ];
+
+  it('flag-off chunk keys are BYTE-IDENTICAL across the M3 namespace bump (pinned hash)', () => {
+    // Independent reconstruction of the pre-namespace key format: pdg-off
+    // keys are sha256 over the sorted filePath:contentHash lines and NOTHING
+    // else. This pin fails if the version token ever leaks into non-pdg keys
+    // (which would force a cold re-parse on every flag-off user).
+    const expected = createHash('sha256').update(Buffer.from('a.ts:h1\nb.ts:h2')).digest('hex');
+    expect(computeChunkHash(entries, false)).toBe(expected);
+    expect(computeChunkHash(entries)).toBe(expected);
+  });
+
+  it('pdg-mode keys CHANGED from the M2-era namespace (v1 chunks invalidate on upgrade)', () => {
+    // The M2-era pdg namespace was `pdg:1;maxFn=<v>` — an M3 binary must not
+    // serve a v1 chunk (its cfgSideChannel lacks `sites`, so taint would
+    // silently no-op on warm caches).
+    const joined = 'a.ts:h1\nb.ts:h2';
+    const m2Key = createHash('sha256')
+      .update(Buffer.from(`pdg:1;maxFn=def\n${joined}`))
+      .digest('hex');
+    expect(computeChunkHash(entries, { pdg: true })).not.toBe(m2Key);
+    // and the v2 key is still deterministic + order-independent
+    expect(computeChunkHash([...entries].reverse(), { pdg: true })).toBe(
+      computeChunkHash(entries, { pdg: true }),
+    );
+  });
+
+  it('pdg-mode keys CHANGED from prior namespaces AND pin the current pdg:5 (FU-C BindingEntry.formalIndex)', () => {
+    // The pdg namespace bumps whenever the worker `cfgSideChannel` SHAPE changes:
+    // U1 added `SiteRecord.at` (pdg:2→3), U4 added the Rust struct-literal
+    // `kind:'new'` site (pdg:3→4), and the FU-C call-summary soundness fix added
+    // `BindingEntry.formalIndex` on param bindings (pdg:4→5) so return-flow keys on
+    // the enclosing formal position, not the flattened binding ordinal. A stale
+    // prior shard lacks the new field, so the call-summary harvest would route to
+    // its conservative empty-summary fallback on a warm cache. Assert prior chunks
+    // are NOT served, and PIN the current pdg:5 namespace so an accidental revert
+    // of the token re-introduces the stale-shape bug.
+    const joined = 'a.ts:h1\nb.ts:h2';
+    const keyOf = (token: string) =>
+      createHash('sha256')
+        .update(Buffer.from(`${token};maxFn=def\n${joined}`))
+        .digest('hex');
+    const current = computeChunkHash(entries, { pdg: true });
+    expect(current).not.toBe(keyOf('pdg:2'));
+    expect(current).not.toBe(keyOf('pdg:3'));
+    expect(current).not.toBe(keyOf('pdg:4'));
+    expect(current).toBe(keyOf('pdg:5'));
   });
 });

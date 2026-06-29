@@ -2,6 +2,7 @@ import type { KnowledgeGraph } from '../core/graph/types.js';
 import { CommunityDetectionResult } from '../core/ingestion/community-processor.js';
 import { ProcessDetectionResult } from '../core/ingestion/process-processor.js';
 import type { ResolutionOutcome } from '../core/ingestion/scope-resolution/resolution-outcome.js';
+import type { PdgEmitManifest } from '../core/lbug/pdg-emit-sink.js';
 
 /** Per-extension breakdown of unsupported files */
 export interface UnsupportedExtension {
@@ -47,4 +48,12 @@ export interface PipelineResult {
   usedWorkerPool: boolean;
   /** Parser coverage stats — which files were parsed vs skipped */
   parserCoverage?: ParserCoverage;
+  /**
+   * Streamed PDG-emit COPY manifest (#2202). Present only when streaming/chunked
+   * PDG emit was active (full rebuild + `--pdg` + enabled): the BasicBlock node
+   * CSV + per-pair PDG-edge CSVs flushed to disk during the emit loop, for
+   * `loadGraphToLbug` to COPY alongside the structural CSVs. Absent ⇒ the PDG
+   * layer (if any) is resident in `graph` and persists via the whole-graph emit.
+   */
+  pdgEmitManifest?: PdgEmitManifest;
 }
