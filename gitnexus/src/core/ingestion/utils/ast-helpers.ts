@@ -230,6 +230,8 @@ export const CLASS_CONTAINER_TYPES = new Set([
   // Go
   'struct_type',
   'interface_type',
+  // Zig
+  'union_declaration',
 ]);
 
 export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
@@ -264,6 +266,10 @@ export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
   companion_object: 'Class',
   struct_type: 'Struct',
   interface_type: 'Interface',
+  // Zig: tagged and untagged unions are class-like containers.
+  // `struct_declaration` and `enum_declaration` are already present
+  // (Dart / generic).
+  union_declaration: 'Union',
 };
 
 /**

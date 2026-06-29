@@ -1,4 +1,5 @@
 import { parentPort, threadId, workerData } from 'node:worker_threads';
+import { createRequire } from 'node:module';
 import Parser from 'tree-sitter';
 import JavaScript from 'tree-sitter-javascript';
 import TypeScript from 'tree-sitter-typescript';
@@ -75,6 +76,13 @@ try {
 let C: TreeSitterLanguage | null = null;
 try {
   C = requireVendoredGrammar('tree-sitter-c') as TreeSitterLanguage;
+} catch {}
+
+// @tree-sitter-grammars/tree-sitter-zig is an optionalDependency — may not be installed
+const _require = createRequire(import.meta.url);
+let Zig: TreeSitterLanguage | null = null;
+try {
+  Zig = _require('@tree-sitter-grammars/tree-sitter-zig');
 } catch {}
 import { getLanguageFromFilename } from 'gitnexus-shared';
 import {
@@ -484,6 +492,7 @@ const languageMap: Record<string, TreeSitterLanguage> = {
   [SupportedLanguages.Vue]: TypeScript.typescript,
   ...(Dart ? { [SupportedLanguages.Dart]: Dart } : {}),
   ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
+  ...(Zig ? { [SupportedLanguages.Zig]: Zig } : {}),
 };
 
 /**
