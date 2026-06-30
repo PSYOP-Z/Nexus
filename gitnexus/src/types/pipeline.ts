@@ -4,6 +4,24 @@ import { ProcessDetectionResult } from '../core/ingestion/process-processor.js';
 import type { ResolutionOutcome } from '../core/ingestion/scope-resolution/resolution-outcome.js';
 import type { PdgEmitManifest } from '../core/lbug/pdg-emit-sink.js';
 
+/** Per-extension breakdown of unsupported files */
+export interface UnsupportedExtension {
+  extension: string;
+  count: number;
+}
+
+/** Parser coverage stats — tracks which files were parsed vs skipped */
+export interface ParserCoverage {
+  /** Total source files in repo (before language filtering) */
+  totalFiles: number;
+  /** Files with supported extensions that entered the parse pipeline */
+  supportedFiles: number;
+  /** Files with unsupported extensions (no grammar defined) */
+  unsupportedFiles: number;
+  /** Per-extension breakdown of unsupported files, sorted by count desc */
+  unsupportedByExtension: UnsupportedExtension[];
+}
+
 // CLI-specific: in-memory result with graph + detection results
 export interface PipelineResult {
   graph: KnowledgeGraph;
@@ -28,6 +46,8 @@ export interface PipelineResult {
    * affordance so regression suites can prove the pool engaged.
    */
   usedWorkerPool: boolean;
+  /** Parser coverage stats — which files were parsed vs skipped */
+  parserCoverage?: ParserCoverage;
   /**
    * Streamed PDG-emit COPY manifest (#2202). Present only when streaming/chunked
    * PDG emit was active (full rebuild + `--pdg` + enabled): the BasicBlock node

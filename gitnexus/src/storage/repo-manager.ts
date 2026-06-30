@@ -91,6 +91,12 @@ export interface RepoMeta {
     communities?: number;
     processes?: number;
     embeddings?: number;
+    parserCoverage?: {
+      totalFiles: number;
+      supportedFiles: number;
+      unsupportedFiles: number;
+      unsupportedByExtension: Array<{ extension: string; count: number }>;
+    };
   };
   /**
    * Bumped whenever incremental-indexing invariants change in an

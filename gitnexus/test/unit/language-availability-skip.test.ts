@@ -86,4 +86,42 @@ describe('native parser availability — unavailable language is skipped, not cr
       );
     expect(warned).toBe(true);
   });
+
+  it('reports parser coverage for unsupported extensions without spawning a pool', async () => {
+    const files: Record<string, string> = {
+      'scripts/bootstrap.sh': '#!/usr/bin/env bash\necho hi\n',
+      'data/report.csv': 'a,b,c\n',
+    };
+    for (const [rel, content] of Object.entries(files)) {
+      const abs = path.join(repoDir, rel);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, content);
+    }
+
+    const scanned = Object.keys(files).map((rel) => ({
+      path: rel,
+      size: fs.statSync(path.join(repoDir, rel)).size,
+    }));
+
+    const result = await runChunkedParseAndResolve(
+      createKnowledgeGraph(),
+      scanned,
+      Object.keys(files),
+      Object.keys(files).length,
+      repoDir,
+      Date.now(),
+      () => {},
+    );
+
+    expect(result.parserCoverage).toEqual({
+      totalFiles: 2,
+      supportedFiles: 0,
+      unsupportedFiles: 2,
+      unsupportedByExtension: [
+        { extension: '.sh', count: 1 },
+        { extension: '.csv', count: 1 },
+      ],
+    });
+    expect(result.usedWorkerPool).toBe(false);
+  });
 });

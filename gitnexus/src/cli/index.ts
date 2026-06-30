@@ -150,6 +150,7 @@ program
     'Embedding vector dimensions (positive integer; e.g. 4096 for Qwen3-Embedding-8B). ' +
       'Must match what the index was built with. Overrides GITNEXUS_EMBEDDING_DIMS.',
   )
+  .option('--json', 'Output analysis result as JSON (includes parserCoverage stats)')
   .addHelpText('after', () => t('help.analyze.environment'))
   .hook('preAction', (thisCommand: Command) => {
     // ONLY GITNEXUS_EMBEDDING_DIMS must be set here: schema.ts reads it at

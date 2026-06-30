@@ -676,6 +676,7 @@ export interface AnalyzeOptions {
   embeddingBatchSize?: string;
   embeddingSubBatchSize?: string;
   embeddingDevice?: string;
+  json?: boolean;
   /**
    * Extra fetch-wrapper function names to treat as HTTP consumers (#1589/#1852
    * residual). Supplied via `.gitnexusrc` `fetchWrappers: [...]`. Threaded into
@@ -1451,11 +1452,24 @@ const analyzeCommandImpl = async (
 
     // ── Summary ────────────────────────────────────────────────────
     const s = result.stats;
-    console.log(`\n  Repository indexed successfully (${totalTime}s)\n`);
-    console.log(
-      `  ${(s.nodes ?? 0).toLocaleString()} nodes | ${(s.edges ?? 0).toLocaleString()} edges | ${s.communities ?? 0} clusters | ${s.processes ?? 0} flows`,
-    );
-    console.log(`  ${repoPath}`);
+    if (options?.json) {
+      console.log(JSON.stringify({ repoPath, totalTime, ...s }, null, 2));
+    } else {
+      console.log(`\n  Repository indexed successfully (${totalTime}s)\n`);
+      console.log(
+        `  ${(s.nodes ?? 0).toLocaleString()} nodes | ${(s.edges ?? 0).toLocaleString()} edges | ${s.communities ?? 0} clusters | ${s.processes ?? 0} flows`,
+      );
+      if (s.parserCoverage && s.parserCoverage.unsupportedFiles > 0) {
+        const pc = s.parserCoverage;
+        const topExts = pc.unsupportedByExtension
+          .slice(0, 5)
+          .map((e) => `${e.extension}: ${e.count}`);
+        console.log(
+          `  Skipped ${pc.unsupportedFiles} files with unsupported extensions (${topExts.join(', ')}${pc.unsupportedByExtension.length > 5 ? ', ...' : ''})`,
+        );
+      }
+      console.log(`  ${repoPath}`);
+    }
 
     // Persistent (non-scrolling) warning when FTS indexing was skipped — the
     // progress-bar log() that fired mid-run has already scrolled away, so the

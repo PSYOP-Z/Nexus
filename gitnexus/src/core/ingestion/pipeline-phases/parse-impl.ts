@@ -390,6 +390,13 @@ export async function runChunkedParseAndResolve(
    *  files. There is no sequential parser — the pool is the sole parse path
    *  whenever a chunk misses the cache. */
   usedWorkerPool: boolean;
+  /** Parser coverage — which files were parsed vs skipped */
+  parserCoverage: {
+    totalFiles: number;
+    supportedFiles: number;
+    unsupportedFiles: number;
+    unsupportedByExtension: Array<{ extension: string; count: number }>;
+  };
   /** Worker-produced ParsedFile artifacts aggregated across chunks.
    *  Threaded into scope-resolution as a re-extract cache so the warm-
    *  cache analyze run can skip the dominant `extractParsedFile` cost
@@ -403,6 +410,28 @@ export async function runChunkedParseAndResolve(
     const lang = getLanguageFromFilename(f.path);
     return lang && isLanguageAvailable(lang);
   });
+
+  // ── Parser coverage stats ──────────────────────────────────────────
+  const unsupportedExtCounts = new Map<string, number>();
+  for (const f of scannedFiles) {
+    const lang = getLanguageFromFilename(f.path);
+    if (!lang) {
+      const ext = path.extname(f.path).toLowerCase() || '(no extension)';
+      unsupportedExtCounts.set(ext, (unsupportedExtCounts.get(ext) || 0) + 1);
+    }
+  }
+  const unsupportedByExtension = Array.from(unsupportedExtCounts.entries())
+    .map(([extension, count]) => ({ extension, count }))
+    .sort((a, b) => b.count - a.count);
+  const unsupportedFiles = unsupportedByExtension.reduce((sum, e) => sum + e.count, 0);
+  const supportedFiles = parseableScanned.length;
+
+  const parserCoverage = {
+    totalFiles: scannedFiles.length,
+    supportedFiles,
+    unsupportedFiles,
+    unsupportedByExtension,
+  };
 
   // Warn about files skipped due to unavailable parsers
   const skippedByLang = new Map<string, number>();
@@ -425,6 +454,14 @@ export async function runChunkedParseAndResolve(
         `Skipping ${count} ${lang} file(s) — ${lang} parser not available (native binding may not have built). Try: npm rebuild tree-sitter-${lang}`,
       );
     }
+  }
+
+  // Warn about files with unsupported extensions (no grammar at all)
+  if (unsupportedFiles > 0) {
+    const topExts = unsupportedByExtension.slice(0, 5).map((e) => `${e.extension}: ${e.count}`);
+    logger.warn(
+      `Skipped ${unsupportedFiles} files with unsupported extensions (${topExts.join(', ')}${unsupportedByExtension.length > 5 ? ', ...' : ''})`,
+    );
   }
 
   // Sort parseableScanned alphabetically for stable chunk membership
@@ -1378,6 +1415,7 @@ export async function runChunkedParseAndResolve(
     // no pool was needed: a warm all-cache-hit run replays cached worker output
     // without spawning workers, or there were no parseable files.
     usedWorkerPool: workerPool !== undefined,
+    parserCoverage,
     // Per-file ParsedFile artifacts produced by workers' calls to
     // `extractParsedFile`. Consumed by scope-resolution as a re-extraction
     // cache: when the file's ParsedFile is here, scope-resolution skips its own
